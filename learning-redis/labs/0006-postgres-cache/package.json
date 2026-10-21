@@ -1,0 +1,15 @@
+{
+  "name": "lab-0006-postgres-cache",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "seed": "node seed.js",
+    "start": "node server.js",
+    "bench": "node bench.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "pg": "^8.16.0",
+    "redis": "^5.8.0"
+  }
+}

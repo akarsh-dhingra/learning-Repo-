@@ -1,0 +1,13 @@
+{
+  "name": "a1-seat-hold-lock",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/*.test.js",
+    "test:solution": "IMPL=../.solution node --test --test-concurrency=1 test/*.test.js",
+    "race": "node scripts/race-demo.js"
+  },
+  "dependencies": {
+    "redis": "^5.8.0"
+  }
+}

@@ -1,0 +1,141 @@
+/* Shared stylesheet for every lesson and reference page in this course. */
+@import url("https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono:wght@400;600&display=swap");
+
+:root {
+  --bg: #fbfaf7;
+  --fg: #1d1c1a;
+  --muted: #6b6760;
+  --rule: #e4e0d8;
+  --accent: #c0362c;      /* Redis-ish red, used sparingly */
+  --accent-soft: #f6e4e1;
+  --ok: #2f6f4f;
+  --ok-soft: #e2f0e8;
+  --bad: #9b2c2c;
+  --bad-soft: #f8e1e1;
+  --code-bg: #f1eee8;
+  --card: #ffffff;
+  --measure: 40rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161514; --fg: #ecebe7; --muted: #a29d94; --rule: #34322e;
+    --accent: #ef6b5e; --accent-soft: #3a211e; --ok: #7fc8a0; --ok-soft: #1c2f25;
+    --bad: #f08a8a; --bad-soft: #3a1f1f; --code-bg: #22211f; --card: #1d1c1a;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #161514; --fg: #ecebe7; --muted: #a29d94; --rule: #34322e;
+  --accent: #ef6b5e; --accent-soft: #3a211e; --ok: #7fc8a0; --ok-soft: #1c2f25;
+  --bad: #f08a8a; --bad-soft: #3a1f1f; --code-bg: #22211f; --card: #1d1c1a;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 18px/1.6 "Source Serif 4", Georgia, serif;
+}
+main { max-width: var(--measure); margin: 0 auto; padding: 3rem 16px 5rem; }
+
+nav.crumbs { font-size: .85rem; color: var(--muted); margin-bottom: 2rem; }
+nav.crumbs a { color: var(--muted); }
+
+.kicker { font: 600 .78rem/1 "JetBrains Mono", monospace; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+h1 { font-size: 2.1rem; line-height: 1.15; margin: .4rem 0 .6rem; font-weight: 600; }
+.lede { font-size: 1.15rem; color: var(--muted); font-style: italic; margin: 0 0 2rem; }
+h2 { font-size: 1.35rem; margin: 2.8rem 0 .6rem; font-weight: 600; border-top: 1px solid var(--rule); padding-top: 1.4rem; }
+h3 { font-size: 1.05rem; margin: 1.6rem 0 .4rem; }
+p, li { hyphens: auto; }
+a { color: var(--accent); text-underline-offset: 2px; }
+sup.cite a { text-decoration: none; font-size: .75em; }
+
+code, pre, kbd { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: .86em; }
+:not(pre) > code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+pre { background: var(--code-bg); padding: 1rem 1.1rem; border-radius: 8px; overflow-x: auto; line-height: 1.5; }
+pre .c { color: var(--muted); }
+
+.win { border-left: 3px solid var(--accent); padding: .2rem 0 .2rem 1rem; margin: 1.5rem 0; }
+.win strong { color: var(--accent); }
+
+.correction { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 8px; overflow: hidden; margin: 1.4rem 0; font-size: .95rem; }
+.correction > div { background: var(--card); padding: .8rem 1rem; }
+.correction .label { font: 600 .7rem/1 "JetBrains Mono", monospace; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); display: block; margin-bottom: .4rem; }
+@media (max-width: 560px) { .correction { grid-template-columns: 1fr; } }
+
+ol.steps { counter-reset: s; list-style: none; padding: 0; }
+ol.steps > li { counter-increment: s; position: relative; padding-left: 2.4rem; margin: .7rem 0; }
+ol.steps > li::before { content: counter(s); position: absolute; left: 0; top: .1rem; width: 1.6rem; height: 1.6rem; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font: 600 .8rem/1.6rem "JetBrains Mono", monospace; text-align: center; }
+
+figure { margin: 1.8rem 0; }
+figure svg { width: 100%; height: auto; display: block; }
+figcaption { font-size: .85rem; color: var(--muted); margin-top: .5rem; }
+svg text { font-family: "JetBrains Mono", monospace; fill: var(--fg); }
+svg .box { fill: var(--card); stroke: var(--fg); stroke-width: 1.2; }
+svg .hot { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.4; }
+svg .line { stroke: var(--muted); stroke-width: 1.3; fill: none; }
+svg .line.hit { stroke: var(--ok); stroke-width: 2; }
+svg .line.miss { stroke: var(--accent); stroke-dasharray: 5 4; }
+svg .small { font-size: 11px; fill: var(--muted); }
+
+table { border-collapse: collapse; width: 100%; font-size: .92rem; margin: 1rem 0; }
+th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-weight: 600; color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+.table-wrap { overflow-x: auto; }
+
+/* Free-recall prompts */
+details.recall { background: var(--card); border: 1px solid var(--rule); border-radius: 8px; padding: .7rem 1rem; margin: .7rem 0; }
+details.recall summary { cursor: pointer; font-weight: 600; }
+details.recall[open] summary { margin-bottom: .5rem; }
+
+/* Quiz component (see quiz.js) */
+.quiz { background: var(--card); border: 1px solid var(--rule); border-radius: 10px; padding: 1rem 1.1rem; margin: 1rem 0; }
+.quiz .q { font-weight: 600; margin: 0 0 .7rem; }
+.quiz .opts { display: grid; gap: .45rem; }
+.quiz button.opt { font: inherit; font-size: .95rem; text-align: left; padding: .55rem .8rem; border: 1px solid var(--rule); background: var(--bg); color: var(--fg); border-radius: 6px; cursor: pointer; }
+.quiz button.opt:hover:not(:disabled) { border-color: var(--fg); }
+.quiz button.opt.right { background: var(--ok-soft); border-color: var(--ok); }
+.quiz button.opt.wrong { background: var(--bad-soft); border-color: var(--bad); }
+.quiz button.opt:disabled { cursor: default; }
+.quiz .fb { margin-top: .7rem; font-size: .92rem; min-height: 1em; }
+.quiz .fb.right { color: var(--ok); }
+.quiz .fb.wrong { color: var(--bad); }
+.quiz.inline .opts { grid-template-columns: 1fr 1fr; }
+.score { font: 600 .85rem "JetBrains Mono", monospace; color: var(--muted); text-align: right; }
+
+.source, .ask { border: 1px solid var(--rule); border-radius: 10px; padding: 1rem 1.1rem; margin: 2rem 0 1rem; background: var(--card); }
+.source h3, .ask h3 { margin-top: 0; }
+.ask { background: var(--accent-soft); border-color: transparent; }
+
+footer.next { display: flex; justify-content: space-between; gap: 1rem; margin-top: 3rem; font-size: .95rem; border-top: 1px solid var(--rule); padding-top: 1rem; }
+
+@media print {
+  body { background: #fff; color: #000; font-size: 11pt; }
+  main { max-width: none; padding: 0; }
+  .quiz, .ask, nav.crumbs, footer.next { break-inside: avoid; }
+  details.recall { display: block; }
+  details.recall > *:not(summary) { display: block; }
+  a { color: #000; }
+}
+
+/* Hash-slot calculator (see hashslot.js) */
+.slotcalc { display: grid; gap: .5rem; margin: 1rem 0; }
+.slotrow { display: grid; grid-template-columns: minmax(0, 14rem) 1fr; gap: .6rem; align-items: center; background: var(--card); border: 1px solid var(--rule); border-radius: 8px; padding: .5rem .7rem; }
+.slotrow input { font: .9rem "JetBrains Mono", monospace; padding: .35rem .5rem; border: 1px solid var(--rule); border-radius: 5px; background: var(--bg); color: var(--fg); width: 100%; }
+.slotrow output { font-size: .9rem; }
+@media (max-width: 560px) { .slotrow { grid-template-columns: 1fr; } }
+
+/* Assignment block shared by every lesson */
+.assignment { border: 2px solid var(--fg); border-radius: 10px; padding: 1rem 1.2rem; margin: 2rem 0; }
+.assignment h3 { margin-top: 0; }
+.assignment .meta { font: .8rem "JetBrains Mono", monospace; color: var(--muted); }
+
+/* Timeline drill rows */
+.timeline { font: .88rem/1.5 "JetBrains Mono", monospace; background: var(--code-bg); border-radius: 8px; padding: .8rem 1rem; margin: 1rem 0; overflow-x: auto; white-space: pre; }
+
+/* Course map */
+.map { list-style: none; padding: 0; counter-reset: none; }
+.map li { display: grid; grid-template-columns: 1.6rem 1fr auto; gap: .6rem; align-items: baseline; padding: .7rem 0; border-bottom: 1px solid var(--rule); }
+.map li input { margin: 0; width: 1.05rem; height: 1.05rem; accent-color: var(--accent); }
+.map .t { font: .78rem "JetBrains Mono", monospace; color: var(--muted); white-space: nowrap; }
+.map .sub { display: block; font-size: .88rem; color: var(--muted); }
+.map li.special { background: var(--accent-soft); border-radius: 8px; padding: .7rem .6rem; border-bottom: none; margin: .4rem 0; }

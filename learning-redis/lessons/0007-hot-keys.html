@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hot Keys</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="0006-caching-postgres-for-real.html">← 0006</a></nav>
+
+<span class="kicker">Lesson 0007 · Video ≈51:00 → ≈54:00 · 20 min</span>
+<h1>Hot keys: when one key melts one node</h1>
+<p class="lede">A celebrity's profile, a flash-sale product, the IPL score. Sharding can't help when the whole crowd wants the same key.</p>
+
+<div class="win"><strong>Your win:</strong> you can name three fixes from the video plus one it skips, say what each costs, and pick the right one for a scenario. That's exactly how this comes up in interviews.</div>
+
+<h2>1. The problem</h2>
+<p>A <strong>hot key</strong> gets far more traffic than any other key. Every request for it hashes to the same slot, so they all hit the same primary (Lesson 0005). Adding nodes spreads <em>other</em> keys but does nothing for this one. The video points out the same problem exists in any distributed cache: Memcached and DynamoDB have it too.</p>
+
+<h2>2. Three fixes from the video</h2>
+<div class="table-wrap"><table>
+  <tr><th>Fix</th><th>How</th><th>Costs</th></tr>
+  <tr><td><strong>1. Read from replicas</strong></td><td>Add replicas to that shard and send reads to them. In a cluster, a connection sends <code>READONLY</code> to read from a replica<sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">[1]</a></sup>.</td><td>Replica reads can be slightly stale (async replication, Lesson 0004). Only helps reads.</td></tr>
+  <tr><td><strong>2. Split the key</strong></td><td>Store N copies: <code>user:42:profile:1</code> … <code>:N</code>. Readers pick a random suffix, so the copies hash to different slots and nodes.</td><td>Every <em>write</em> must update all N copies. Copies can briefly disagree. More memory.</td></tr>
+  <tr><td><strong>3. Local in-app cache</strong></td><td>A small LRU map inside each app server, checked before Redis, with a very short TTL (the video says 50–200 ms).</td><td>Each server can be stale for up to that TTL. Memory per server. Thousands of requests never leave the process.</td></tr>
+</table></div>
+
+<p>Fix 3 is something the Redis docs cover directly. <strong>Client-side caching</strong> keeps popular values in application memory, and Redis 6+ can <em>tell</em> your client when a cached key changes (“tracking” and invalidation messages), so you don't have to rely only on a short TTL<sup class="cite"><a href="https://redis.io/docs/latest/develop/reference/client-side-caching/">[2]</a></sup>. The docs also give a rule for what to cache this way: keys requested often that change at a reasonable rate, not a counter that's incremented constantly<sup class="cite"><a href="https://redis.io/docs/latest/develop/reference/client-side-caching/">[2]</a></sup>.</p>
+
+<h2>3. One the video skips: the stampede</h2>
+<p>A hot key's TTL expires. In the same millisecond, 5,000 requests miss and <em>all</em> of them query Postgres. This is a <strong>cache stampede</strong> (also called the thundering herd), and the database is the one that falls over.</p>
+<ul>
+  <li><strong>Single-flight</strong>: on a miss, only the request that wins <code>SET rebuild:product:42 1 NX PX 5000</code> queries the DB. The others wait briefly and re-read the cache. That's a tiny lock, a preview of Lesson 0009.</li>
+  <li><strong>Jittered TTLs</strong>: <code>EX 600 + random(0..60)</code>, so keys cached together don't all expire together.</li>
+  <li><strong>Refresh ahead</strong>: rebuild in the background when the TTL is nearly up, so readers never see a miss.</li>
+</ul>
+
+<h2>4. Finding hot keys</h2>
+<p><code>redis-cli --hotkeys</code> samples keys by access frequency, but it <strong>only works when <code>maxmemory-policy</code> is an LFU policy</strong><sup class="cite"><a href="https://redis.io/docs/latest/develop/tools/cli/">[3]</a></sup>, because it relies on LFU's frequency counters. Try it on your container:</p>
+<pre>docker exec redis-stack redis-cli CONFIG SET maxmemory-policy allkeys-lfu
+docker exec redis-stack redis-cli -r 2000 GET product:42 > /dev/null   <span class="c"># make one key hot (it must exist: run the 0006 lab first)</span>
+docker exec redis-stack redis-cli --hotkeys
+docker exec redis-stack redis-cli CONFIG SET maxmemory-policy noeviction  <span class="c"># restore</span></pre>
+
+<div class="correction">
+  <div><span class="label">The video calls fix 2</span>“cache breaking … using key sharding” and shows reads spreading across copies.</div>
+  <div><span class="label">Don't forget</span>The write side. With N copies, an update must touch all N (or delete all N). A reader can briefly see the old value on some copies. Mention this cost before the interviewer does.</div>
+</div>
+
+<h2>5. Scenario drill</h2>
+<section id="q7">
+<div class="quiz" data-explain="Reads dominate and a few seconds of staleness is fine, so an in-process cache with a tiny TTL removes most network trips entirely.">
+  <p class="q">Live cricket score: 2M reads/sec on one key, updated every few seconds, slight lag is fine.</p>
+  <div class="opts"><button class="opt" data-correct>In-app cache with short TTL</button><button class="opt">Split into many write copies</button><button class="opt">A bigger single Redis primary</button><button class="opt">Disable the TTL on it</button></div>
+</div>
+<div class="quiz" data-explain="Flash-sale stock is written constantly, so copies would disagree and every write would fan out N times. Reads from replicas don't help writes. The real fix is to change the design (Lesson 0009 territory).">
+  <p class="q">Flash-sale <code>stock:iphone</code> is decremented 50k times/sec. Which fix from the table helps most?</p>
+  <div class="opts"><button class="opt">In-app cache with short TTL</button><button class="opt">Split into many write copies</button><button class="opt">Read from many more replicas</button><button class="opt" data-correct>None; redesign the write path</button></div>
+</div>
+<div class="quiz" data-explain="Everyone missed at the same moment because the TTL expired. Single-flight lets one request rebuild while the rest wait.">
+  <p class="q">Every hour on the hour, DB CPU spikes to 100% for two seconds. Likely cause?</p>
+  <div class="opts"><button class="opt" data-correct>Stampede when hot TTLs expire</button><button class="opt">Replica lag during a failover</button><button class="opt">CROSSSLOT errors from MSET calls</button><button class="opt">LRU sampling is too small</button></div>
+</div>
+<p class="score" data-for="q7"></p>
+</section>
+
+<details class="recall"><summary>Recall: why doesn't adding nodes help a hot key? (One sentence.)</summary>
+One key hashes to one slot owned by one primary, so new nodes take other slots but never that one.</details>
+
+<div class="assignment">
+<h3>Assignment 0007: L1 cache and single-flight</h3>
+<p class="meta">≈15 min · edit <code>labs/0006-postgres-cache/server.js</code></p>
+<ol class="steps">
+  <li>Add a tiny in-process cache: a <code>Map</code> of <code>key → { value, expiresAt }</code> with a 200 ms TTL and a 1,000-entry cap (delete the oldest entry when full). Check it before Redis in <code>GET /products/:id</code>, and report <code>source: "local"</code>.</li>
+  <li>Fire 500 requests for <code>/products/42</code> with <code>Promise.all</code> and count the sources. How many reached Redis?</li>
+  <li>Single-flight on a miss: only the caller that wins <code>SET rebuild:&lt;key&gt; 1 NX PX 3000</code> queries Postgres. Everyone else retries the cache every 20 ms for up to 1 s. Test it: <code>DEL product:42</code>, fire 200 concurrent requests, and count the DB queries with a counter. The target is 1.</li>
+</ol>
+<p>Send me the counts and code and I'll review them.</p>
+</div>
+
+<div class="source"><h3>Primary source</h3><p><a href="https://redis.io/docs/latest/develop/reference/client-side-caching/">Client-side caching reference</a>. Read the intro, “The Redis implementation…” and “What to cache” (about 10 min).</p></div>
+<div class="ask"><h3>Questions?</h3><p>Ask me “how do Twitter/X-scale systems handle celebrity timelines?”. It's a great follow-up interview question.</p></div>
+
+<footer class="next">
+  <a href="0006-caching-postgres-for-real.html">← 0006</a>
+  <a href="0008-rate-limiting.html">0008 · Rate limiting →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run Redis, Cache an API</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="0001-why-cache-and-what-redis-is.html">← Lesson 0001</a> · <a href="../reference/redis-basics.html">Reference: Redis basics</a></nav>
+
+<span class="kicker">Lesson 0002 · Video ~7:00 → ~20:00</span>
+<h1>Run Redis, then cache a slow API</h1>
+<p class="lede">The video's first demo, rebuilt so you can run it: a few commands by hand, then cache-aside in about 40 lines of Node.</p>
+
+<div class="win"><strong>Your win for this lesson:</strong> Redis running on your laptop, a correct prediction for what <code>TTL</code> returns in four tricky cases, and a Node endpoint that goes from about 100&nbsp;ms to a few ms on the second call.</div>
+
+<h2>1. Start Redis</h2>
+<p>Start Docker Desktop first (the daemon wasn't running when I checked your machine). Then run the same image the video uses. It includes Redis on <code>6379</code> and the RedisInsight web UI on <code>8001</code>:</p>
+<pre>docker run -d --name redis-stack -p 6379:6379 -p 8001:8001 redis/redis-stack:latest
+docker ps                     <span class="c"># should list redis-stack</span>
+open http://localhost:8001    <span class="c"># RedisInsight: keys on the left, values on the right</span></pre>
+<p>Open a CLI inside the container<sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/install/install-stack/docker/">[1]</a></sup>:</p>
+<pre>docker exec -it redis-stack redis-cli</pre>
+
+<h2>2. Six commands, then four predictions</h2>
+<div class="table-wrap"><table>
+  <tr><th>Command</th><th>Does</th></tr>
+  <tr><td><code>SET name aniket</code></td><td>Store a string under a key. Overwrites any existing value.</td></tr>
+  <tr><td><code>GET name</code></td><td>Read it back. Returns <code>(nil)</code> if the key doesn't exist.</td></tr>
+  <tr><td><code>SET name aniket EX 30</code></td><td>Store it <em>and</em> give it a 30-second TTL in one atomic command.</td></tr>
+  <tr><td><code>TTL name</code></td><td>Seconds left. <code>-1</code> = no expiry set. <code>-2</code> = key doesn't exist<sup class="cite"><a href="https://redis.io/docs/latest/commands/expire/">[2]</a></sup>.</td></tr>
+  <tr><td><code>INCR count</code></td><td>Treat the value as an integer and add 1, atomically.</td></tr>
+  <tr><td><code>SET k v NX</code></td><td>Only set it if the key <em>doesn't</em> exist yet (the video's NX demo).</td></tr>
+</table></div>
+<p>Key names follow the video's convention <code>entity:id</code> (<code>user:42</code>, <code>post:10</code>). RedisInsight's tree view groups keys by the colon.</p>
+
+<section id="predict">
+<h3>Predict first, then run it in redis-cli</h3>
+<p>Pick an answer <em>before</em> typing the commands. Being wrong here is useful: it shows you exactly which mental model to fix.</p>
+
+<div class="quiz" data-explain="A key with no expiry returns -1.">
+  <p class="q"><code>SET name aniket</code> → <code>TTL name</code></p>
+  <div class="opts">
+    <button class="opt" data-correct>-1 (no-expiry)</button>
+    <button class="opt">-2 (no-key)</button>
+    <button class="opt">0 (expired)</button>
+    <button class="opt">nil (unknown)</button>
+  </div>
+</div>
+
+<div class="quiz" data-explain="-2 means the key doesn't exist at all. TTL also returns -2 once a key has expired, which is a quick way to check whether something expired.">
+  <p class="q"><code>TTL ghost</code> (a key you never set)</p>
+  <div class="opts">
+    <button class="opt">-1 (no-expiry)</button>
+    <button class="opt" data-correct>-2 (no-key)</button>
+    <button class="opt">0 (expired)</button>
+    <button class="opt">nil (unknown)</button>
+  </div>
+</div>
+
+<div class="quiz" data-explain="The big gotcha: a plain SET replaces the whole key, including its TTL. The key now never expires. If you overwrite a cached value, pass EX again.">
+  <p class="q"><code>SET name aniket EX 100</code> → <code>SET name yannick</code> → <code>TTL name</code></p>
+  <div class="opts">
+    <button class="opt">≈100 (kept)</button>
+    <button class="opt" data-correct>-1 (cleared)</button>
+    <button class="opt">-2 (deleted)</button>
+    <button class="opt">0 (expired)</button>
+  </div>
+</div>
+
+<div class="quiz" data-explain="INCR changes the value but doesn't replace the key, so the TTL stays. Commands that change a value in place (INCR, LPUSH, HSET) keep the timeout; commands that replace the key (SET, DEL) clear it. The EXPIRE docs list these. Lesson 0008 (rate limiting) relies on this.">
+  <p class="q"><code>SET count 4 EX 100</code> → <code>INCR count</code> → <code>TTL count</code></p>
+  <div class="opts">
+    <button class="opt" data-correct>≈100 (kept)</button>
+    <button class="opt">-1 (cleared)</button>
+    <button class="opt">-2 (deleted)</button>
+    <button class="opt">0 (expired)</button>
+  </div>
+</div>
+<p class="score" data-for="predict"></p>
+</section>
+
+<div class="correction">
+  <div><span class="label">The video does</span>Sets the value and its expiry as separate steps (the TTL is set from the RedisInsight UI) and adds <code>NX</code> later on.</div>
+  <div><span class="label">Prefer</span><code>SET key value EX n</code> as <em>one</em> command. If your app crashes between a <code>SET</code> and a separate <code>EXPIRE</code>, the key never expires. And as you just saw, any later plain <code>SET</code> removes the TTL anyway<sup class="cite"><a href="https://redis.io/docs/latest/commands/expire/">[2]</a></sup>.</div>
+</div>
+
+<h2>3. Cache-aside in Node</h2>
+<p>The video's demo calls JSONPlaceholder (a free fake API) and caches each post under <code>post:&lt;id&gt;</code>. Your copy is ready to run at <code>~/learning-redis/labs/0002-cache-aside/</code> (dependencies are already installed). Here's the core of it, using the official <code>node-redis</code> client<sup class="cite"><a href="https://redis.io/docs/latest/develop/clients/nodejs/">[3]</a></sup>:</p>
+<pre>const key = `post:${req.params.id}`;
+
+<span class="c">// 1. Check the cache first</span>
+const cached = await redis.get(key);
+if (cached) return res.json({ source: "redis", data: JSON.parse(cached) });
+
+<span class="c">// 2. Miss: go to the slow source of truth</span>
+const data = await (await fetch(`https://jsonplaceholder.typicode.com/posts/${req.params.id}`)).json();
+
+<span class="c">// 3. Fill the cache with a TTL, then respond</span>
+await redis.set(key, JSON.stringify(data), { EX: 600 });
+res.json({ source: "external-api", data });</pre>
+<p>Two details: Redis stores strings, so objects go in with <code>JSON.stringify</code> and come out with <code>JSON.parse</code>. And node-redis takes options as an object, so <code>{ EX: 600 }</code> is the same as <code>EX 600</code> in the CLI<sup class="cite"><a href="https://redis.io/docs/latest/develop/clients/nodejs/migration/">[4]</a></sup>.</p>
+
+<h3>Run it</h3>
+<pre>cd ~/learning-redis/labs/0002-cache-aside
+npm start
+<span class="c"># in another terminal</span>
+curl -s localhost:3000/posts/10 | head -c 80; echo   <span class="c"># source: external-api</span>
+curl -s localhost:3000/posts/10 | head -c 80; echo   <span class="c"># source: redis — compare "ms"</span></pre>
+<p>In the video the first call took a few hundred ms and the cached one about 10&nbsp;ms. Write down <em>your</em> two numbers. Then, in redis-cli:</p>
+<pre>TTL post:10     <span class="c"># counting down from 600</span>
+DEL post:10     <span class="c"># next curl is a miss again</span></pre>
+
+<section id="bugs">
+<h3>Spot the bug</h3>
+<div class="quiz" data-explain="Without EX the key never expires. If the upstream data changes, you serve the old version forever, or until Redis evicts it under memory pressure.">
+  <p class="q">A teammate writes <code>await redis.set(key, JSON.stringify(data));</code> What goes wrong?</p>
+  <div class="opts">
+    <button class="opt" data-correct>Entries never expire, so data goes stale</button>
+    <button class="opt">Redis rejects SET calls without a TTL</button>
+    <button class="opt">GET returns undefined instead of cached value</button>
+    <button class="opt">Every request becomes a cache miss forever</button>
+  </div>
+</div>
+<div class="quiz" data-explain="The key has to include everything that identifies the data. With a fixed key 'post', the first post cached is returned for every ID until it expires.">
+  <p class="q">The key is written as <code>const key = "post";</code> What happens?</p>
+  <div class="opts">
+    <button class="opt" data-correct>All IDs share one cached post</button>
+    <button class="opt">Redis rejects keys without a colon</button>
+    <button class="opt">Each request overwrites then misses again</button>
+    <button class="opt">Nothing breaks; keys are just shorter</button>
+  </div>
+</div>
+<p class="score" data-for="bugs"></p>
+</section>
+
+<h2>4. Bring it to your project</h2>
+<p>Pick one read-heavy GET endpoint in your own code (a hotel or listing detail page in <code>~/hotelBookingPlatform</code> is a good fit) and wrap it in the same three steps. Note the latency before and after, because <em>“p50 went from X to Y ms”</em> is a great line in an interview. Ask me if you'd like a hand with it.</p>
+
+<details class="recall"><summary>Interview rep: “What could go wrong with the cache you just added?”</summary>
+<ul>
+  <li><strong>Stale reads</strong> for up to the TTL. Fix: <code>DEL</code> the key when the data is written (invalidation).</li>
+  <li><strong>Forgotten TTL</strong> or a plain <code>SET</code> overwriting one, so keys live forever.</li>
+  <li><strong>Bad keys</strong>: a key that leaves out part of the query (ID, locale, user) serves the wrong data.</li>
+  <li><strong>Redis down</strong>: cache-aside can fall back to the DB, but make sure Redis errors don't crash the request.</li>
+</ul></details>
+
+<div class="source">
+<h3>Primary source</h3>
+<p>The official <a href="https://redis.io/docs/latest/commands/expire/">EXPIRE / TTL docs</a>. Read “Details” and “How Redis expires keys” (about 6 min). It explains exactly why the SET-vs-INCR prediction behaves the way it does.</p>
+</div>
+
+<div class="ask">
+<h3>Ask me anything</h3>
+<p>If <code>docker run</code> or <code>npm start</code> fails, paste the error in the terminal. You can also ask “why JSON.stringify and not a hash?”. That's a good question, and <a href="0003-data-structures-toolkit.html">Lesson 0003</a> answers it.</p>
+</div>
+
+<footer class="next">
+  <a href="0001-why-cache-and-what-redis-is.html">← Lesson 0001</a>
+  <a href="0003-data-structures-toolkit.html">0003 · Pick the right structure →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

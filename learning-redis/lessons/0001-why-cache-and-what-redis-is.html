@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why Cache, Why Redis</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="../reference/redis-basics.html">Reference: Redis basics</a> · Lesson 1 of the Redis course</nav>
+
+<span class="kicker">Lesson 0001 · Video 0:00 → ~7:00</span>
+<h1>Why cache, and why Redis is fast</h1>
+<p class="lede">The opening minutes of the video in one idea: stop asking the database the same question twice.</p>
+
+<div class="win"><strong>Your win for this lesson:</strong> you can draw the cache-aside flow from memory, predict whether a request is a hit or a miss, and give a 60-second interview answer on why Redis is fast and what it gives up.</div>
+
+<h2>1. The problem</h2>
+<p>The video opens with a profile screen. Every time a user opens the app, the server reads their name, username and email from the database. At a few users this is fine. At a million users, the database answers the <em>same unchanging question</em> over and over, gets overloaded, and every query slows down.</p>
+<p>The key observation: profile data is <strong>read far more often than it changes</strong>. That is the signature of data worth caching.</p>
+
+<h2>2. The fix: cache-aside</h2>
+<p>Put a fast in-memory store beside the server and let the <em>application</em> manage it. This pattern is called <strong>cache-aside</strong> (also “lazy loading”)<sup class="cite"><a href="https://redis.antirez.com/fundamental/cache-aside.html">[1]</a></sup>.</p>
+
+<figure>
+<svg viewBox="0 0 640 210" role="img" aria-label="Cache-aside: the server checks Redis first; on a miss it reads the database and writes the result to Redis.">
+  <rect class="box" x="10" y="80" width="110" height="50" rx="6"/>
+  <text x="65" y="110" text-anchor="middle">Client</text>
+  <rect class="box" x="230" y="80" width="130" height="50" rx="6"/>
+  <text x="295" y="110" text-anchor="middle">App server</text>
+  <rect class="hot" x="480" y="10" width="140" height="50" rx="6"/>
+  <text x="550" y="40" text-anchor="middle">Redis (RAM)</text>
+  <rect class="box" x="480" y="150" width="140" height="50" rx="6"/>
+  <text x="550" y="180" text-anchor="middle">Database</text>
+  <line class="line" x1="120" y1="105" x2="230" y2="105"/>
+  <text class="small" x="175" y="97" text-anchor="middle">① request</text>
+  <path class="line hit" d="M360 92 L480 40"/>
+  <text class="small" x="395" y="52">② GET key</text>
+  <text class="small" x="372" y="78">hit → return</text>
+  <path class="line miss" d="M360 118 L480 175"/>
+  <text class="small" x="372" y="170">③ miss → query</text>
+  <path class="line miss" d="M560 150 L560 60"/>
+  <text class="small" x="568" y="110">④ SET key</text>
+</svg>
+<figcaption>Green: the fast path. Dashed red: the slow path, which happens once per key per TTL window.</figcaption>
+</figure>
+
+<ol class="steps">
+  <li>A request arrives. The server asks Redis for the key first (e.g. <code>user:42</code>).</li>
+  <li><strong>Hit:</strong> Redis has it, so return it straight away. The database is never touched.</li>
+  <li><strong>Miss:</strong> Redis does not have it, so the server queries the database.</li>
+  <li>The server writes the result into Redis with a <strong>TTL</strong> (time to live), then responds. The next request for that key is a hit.</li>
+</ol>
+<p>Notice who does the work: <em>your app</em> reads the DB and fills Redis. Redis never talks to your database. That is why it's called cache-<em>aside</em>: the cache sits to one side of your app and your app decides what goes in it. A bonus from the same source: if Redis goes down, the app can fall back to the database and keep working, only slower<sup class="cite"><a href="https://redis.antirez.com/fundamental/cache-aside.html">[1]</a></sup>.</p>
+
+<h2>3. What Redis is</h2>
+<p>Redis is an <strong>in-memory key-value data store</strong>. Every piece of data has a string key, and the value can be a plain string or a real data structure (list, hash, set, sorted set…). Redis's own FAQ puts it as “an in-memory but persistent on disk database”: very fast reads and writes, but your data set can't be bigger than your RAM<sup class="cite"><a href="https://redis.io/docs/latest/develop/get-started/faq/">[2]</a></sup>.</p>
+<p>The video lists four jobs you'll meet later in this course: <strong>cache</strong> (most common), <strong>message broker</strong> (Pub/Sub), <strong>distributed lock</strong>, and <strong>stream processing</strong>.</p>
+
+<h2>4. Why it's fast, and what it gives up</h2>
+<table>
+  <tr><th>Reason</th><th>What it means</th></tr>
+  <tr><td>Data lives in RAM</td><td>No disk seeks on the read path. Disk is only used for saving copies (persistence).</td></tr>
+  <tr><td>Commands run one at a time</td><td>No locks or race conditions between commands, and no time lost switching between threads.</td></tr>
+  <tr><td>Simple in-memory structures</td><td>Data structures in RAM are much simpler to work with than the same structures on disk<sup class="cite"><a href="https://redis.io/docs/latest/develop/get-started/faq/">[2]</a></sup>.</td></tr>
+</table>
+
+<p><strong>The price is durability.</strong> RAM is lost when the machine dies. Redis can save copies to disk in two ways<sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/">[3]</a></sup>:</p>
+<ul>
+  <li><strong>RDB</strong>: snapshots of everything, taken every few minutes. If Redis crashes, you lose whatever changed since the last snapshot.</li>
+  <li><strong>AOF</strong> (append-only file): a log of every write. By default it's flushed to disk every second, so a crash loses <em>about one second</em> of writes.</li>
+  <li>Or <strong>no persistence at all</strong>, which is common for a pure cache. If you lose the cache, you just refill it from the DB.</li>
+</ul>
+
+<div class="correction">
+  <div><span class="label">The video says</span>Redis is “up to 100× faster than MySQL or MongoDB” and “single-threaded”, and only AOF is mentioned for persistence.</div>
+  <div><span class="label">The docs say</span>Treat “100×” as a rough figure, not a benchmark. The FAQ quotes about 1M requests/sec with pipelining and says Redis usually runs out of memory or network before CPU. <em>Command execution</em> is single-threaded, but Redis already uses background threads for some work. RDB snapshots are on by default and AOF is opt-in<sup class="cite"><a href="https://redis.io/docs/latest/develop/get-started/faq/">[2]</a></sup><sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/">[3]</a></sup>.</div>
+</div>
+
+<p>If you need Redis behaviour with stronger durability, the video points to managed options with disk-backed storage (it names AWS MemoryDB), which are a bit slower.</p>
+
+<h2>5. Practice: recall first, then check</h2>
+<p>Close your eyes or cover the page, answer out loud, <em>then</em> open each one. Answering from memory before you look is what makes it stick.</p>
+
+<details class="recall"><summary>Say the four cache-aside steps in order.</summary>
+Check Redis → hit: return → miss: query DB → write to Redis with a TTL, then return.</details>
+<details class="recall"><summary>Name three reasons Redis is fast.</summary>
+RAM storage; commands run one at a time, so no locks and no time lost switching threads; simple in-memory data structures.</details>
+<details class="recall"><summary>What's the trade-off, in one sentence?</summary>
+Redis trades durability for speed: data in RAM can be lost, and even with AOF set to flush every second you can lose about a second of writes.</details>
+
+<section id="quiz1">
+<h3>Check yourself</h3>
+<div class="quiz" data-explain="In cache-aside, your application reads the database on a miss and writes the result into Redis. Redis never talks to your database itself.">
+  <p class="q">In cache-aside, what happens on a cache miss?</p>
+  <div class="opts">
+    <button class="opt" data-correct>Read the DB, write Redis, then respond</button>
+    <button class="opt">Return empty and wait for Redis refresh</button>
+    <button class="opt">Write the DB, skip Redis, then respond</button>
+    <button class="opt">Ask Redis to fetch from the DB</button>
+  </div>
+</div>
+
+<div class="quiz" data-explain="Flushing every write to disk is the slowest persistence mode (appendfsync always), so it slows Redis down rather than explaining its speed.">
+  <p class="q">Which of these is NOT a reason Redis is fast?</p>
+  <div class="opts">
+    <button class="opt">Data lives in RAM</button>
+    <button class="opt">No locks between commands</button>
+    <button class="opt">Simple in-memory data structures</button>
+    <button class="opt" data-correct>Every write is fsynced</button>
+  </div>
+</div>
+
+<div class="quiz" data-explain="Commands are executed one at a time, which is why there are no locks. Redis still uses other threads for background work, and newer versions can also use threads for network I/O.">
+  <p class="q">“Redis is single-threaded” most precisely means:</p>
+  <div class="opts">
+    <button class="opt" data-correct>Commands execute one at a time</button>
+    <button class="opt">Redis uses one CPU thread only</button>
+    <button class="opt">Each client gets its own thread</button>
+    <button class="opt">Reads and writes use separate threads</button>
+  </div>
+</div>
+
+<div class="quiz" data-explain="The default AOF policy (appendfsync everysec) flushes to disk once per second, so a crash can lose about one second of writes.">
+  <p class="q">With AOF on its default settings, a crash can lose at most…</p>
+  <div class="opts">
+    <button class="opt" data-correct>About one second of writes</button>
+    <button class="opt">Nothing; every write is safe</button>
+    <button class="opt">Everything since the last snapshot</button>
+    <button class="opt">Only keys that had TTLs</button>
+  </div>
+</div>
+
+<div class="quiz" data-explain="Nothing told Redis that the email changed, so it keeps returning the cached copy until the TTL deletes it. This is the stale-data trade-off of caching. The video comes back to it as “eventually consistent”.">
+  <p class="q">A profile is cached with a 10-minute TTL. The user changes their email in the DB. The next read returns…</p>
+  <div class="opts">
+    <button class="opt" data-correct>The old email until expiry</button>
+    <button class="opt">The new email right away</button>
+    <button class="opt">An error until Redis restarts</button>
+    <button class="opt">Nothing until user logs in</button>
+  </div>
+</div>
+<p class="score" data-for="quiz1"></p>
+</section>
+
+<section id="drill">
+<h3>Drill: hit or miss?</h3>
+<p>The cache starts empty. Every key is written with <code>TTL = 60s</code> when it's fetched from the DB. A key expires 60 seconds after it was <em>written</em>; a GET doesn't reset the clock. Call each request in order.</p>
+
+<div class="quiz inline" data-fixed data-explain="The cache was empty, so it's a miss. user:42 is now cached until t=60s.">
+  <p class="q">t = 0s · GET user:42</p>
+  <div class="opts"><button class="opt">Cache hit</button><button class="opt" data-correct>Cache miss</button></div>
+</div>
+<div class="quiz inline" data-fixed data-explain="Written at t=0, so it's alive until t=60.">
+  <p class="q">t = 10s · GET user:42</p>
+  <div class="opts"><button class="opt" data-correct>Cache hit</button><button class="opt">Cache miss</button></div>
+</div>
+<div class="quiz inline" data-fixed data-explain="This is a different key that has never been fetched. It's cached now, until t=90s.">
+  <p class="q">t = 30s · GET user:7</p>
+  <div class="opts"><button class="opt">Cache hit</button><button class="opt" data-correct>Cache miss</button></div>
+</div>
+<div class="quiz inline" data-fixed data-explain="It expired at t=60, and the hit at t=10 didn't extend it. Miss: it's fetched again and cached until t=135.">
+  <p class="q">t = 75s · GET user:42</p>
+  <div class="opts"><button class="opt">Cache hit</button><button class="opt" data-correct>Cache miss</button></div>
+</div>
+<div class="quiz inline" data-fixed data-explain="user:7 was written at t=30, so it's alive until t=90.">
+  <p class="q">t = 80s · GET user:7</p>
+  <div class="opts"><button class="opt" data-correct>Cache hit</button><button class="opt">Cache miss</button></div>
+</div>
+<div class="quiz inline" data-fixed data-explain="It was rewritten at t=75, so it's alive until t=135. If you said miss, you counted from the first write.">
+  <p class="q">t = 130s · GET user:42</p>
+  <div class="opts"><button class="opt" data-correct>Cache hit</button><button class="opt">Cache miss</button></div>
+</div>
+<p class="score" data-for="drill"></p>
+</section>
+
+<h2>6. Interview rep</h2>
+<p>Set a 60-second timer and answer out loud: <em>“Our profile endpoint is slow under load. What would you do?”</em> Then compare.</p>
+<details class="recall"><summary>A strong answer covers…</summary>
+<ul>
+  <li>Spot the pattern: many reads, few changes, so it's a good thing to cache.</li>
+  <li>Cache-aside with Redis: check the cache, on a miss read the DB, write with a TTL, return.</li>
+  <li>Why Redis: data lives in RAM so reads are very fast, and it takes repeated read load off the DB.</li>
+  <li>Trade-offs: stale data for up to the TTL (fix by deleting the key when the profile updates); RAM is limited; durability doesn't matter much for a cache, since the DB still has the real data.</li>
+</ul></details>
+
+<div class="source">
+<h3>Primary source</h3>
+<p>Read the <a href="https://redis.antirez.com/fundamental/cache-aside.html">Cache-Aside Pattern</a> write-up (about 5 min), then skim the <a href="https://redis.io/docs/latest/develop/get-started/faq/">Redis FAQ</a> sections “How is Redis different…” and “How can Redis use multiple CPUs”.</p>
+</div>
+
+<div class="ask">
+<h3>Stuck on anything?</h3>
+<p>Ask me in the terminal. For example: “why not just add an index to the DB instead?”, “what TTL should I pick?”, or “explain the drill question I got wrong”.</p>
+</div>
+
+<footer class="next">
+  <span></span>
+  <a href="0002-first-commands-and-cache-aside-in-node.html">Next: Lesson 0002 · Run Redis and cache an API →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

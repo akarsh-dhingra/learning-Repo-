@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebSockets Capstone</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="../reference/backend-patterns.html">Reference: backend patterns</a> · Capstone</nav>
+
+<span class="kicker">Capstone · 4–6 h · your own project</span>
+<h1>Build the socket layer for one mission app</h1>
+<p class="lede">No reference solution this time. Pick one, design it in writing, build it multi-node, and load-test it. Then defend it, the way you would in a design review.</p>
+
+<h2>Pick one</h2>
+<div class="table-wrap"><table>
+  <tr><th>Track</th><th>Must have</th><th>Stretch</th></tr>
+  <tr><td><strong>Excalidraw</strong></td><td>Rooms with shapes (move, resize, delete) using per-element versions and last-writer-wins; auth; resume by seq; 2+ nodes</td><td>Undo/redo per user; persistence to Postgres with snapshots every N events</td></tr>
+  <tr><td><strong>Gather Town</strong></td><td>Spaces with owners (0010), interest management (0009), proximity chat, presence, failover</td><td>Doors between spaces (handoff to another owner node); nearest-K visibility</td></tr>
+  <tr><td><strong>CEX</strong></td><td>2+ symbols, gap-free books with the 0011 algorithm, private order streams, rate limits, 2+ gateways</td><td>Conflated <code>@depth20@100ms</code> stream; 24 h max connection age with a graceful reconnect</td></tr>
+  <tr><td><strong>Multiplayer game</strong></td><td>Match rooms with an authoritative 20 Hz tick, server-side input validation, client prediction + reconciliation</td><td>Matchmaking service; spectators via a separate read-only fan-out</td></tr>
+</table></div>
+
+<h2>Deliverables</h2>
+<ol class="steps">
+  <li><strong>Design doc (1–2 pages)</strong> in <code>build/capstone/DESIGN.md</code>: message protocol table (type, direction, durable/ephemeral, ack?), Pattern A or B and why, fan-out math for your biggest room, failure table (node dies, Redis dies, client on a bad network, deploy), and what you'd monitor.</li>
+  <li><strong>Implementation</strong>: multi-node, with <code>/metrics</code>, graceful drain, and a reconnecting client.</li>
+  <li><strong>Black-box tests</strong> written by you, using <code>labs/_shared/test-client.ts</code>, covering at least: auth rejection, one durable flow end-to-end across two nodes, resume or resync after a forced gap, and a slow consumer.</li>
+  <li><strong>Load test</strong>: adapt <code>labs/0012-operating-it/loadtest.ts</code>. Report p50/p99 of your critical path at two load levels, and explain the bottleneck you found, with evidence (metrics, <code>CLIENT LIST</code>, CPU).</li>
+</ol>
+
+<h2>How it's reviewed</h2>
+<p>Paste the path to <code>DESIGN.md</code>, your test output and your load-test numbers in the terminal. I'll review it like a senior engineer in a design review, with follow-up questions such as <em>“what happens to an order placed during the 3 s your gateway's Redis connection was down?”</em> Then post the design doc to <a href="https://www.reddit.com/r/ExperiencedDevs/">r/ExperiencedDevs</a> or <a href="https://www.reddit.com/r/gamedev/">r/gamedev</a> for critique from people who run these systems.</p>
+
+<div class="ask"><h3>Before you start</h3><p>Tell me which track you picked and I'll help you scope it to fit 4–6 hours.</p></div>
+
+<footer class="next">
+  <a href="0012-operating-it.html">← Lesson 0012 · Operating it</a>
+  <a href="index.html">Course map →</a>
+</footer>
+</main>
+</body>
+</html>

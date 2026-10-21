@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis Cluster Reference</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="../lessons/index.html">Course map</a> · Reference · used by <a href="../lessons/0004-consistency-and-replication.html">0004</a>, <a href="../lessons/0005-redis-cluster.html">0005</a></nav>
+<span class="kicker">Cheat sheet</span>
+<h1>Replication &amp; Cluster</h1>
+
+<h2>Replication</h2>
+<ul>
+  <li><strong>Asynchronous</strong> by default: the primary acknowledges before replicas have the write.</li>
+  <li>Replicas are <strong>read-only</strong> (<code>READONLY</code> error on writes).</li>
+  <li><code>WAIT n ms</code> reduces the chance of losing a write but does <strong>not</strong> make Redis strongly consistent.</li>
+  <li>Automatic failover needs <strong>Sentinel</strong> or <strong>Cluster</strong>. Plain replication doesn't promote anything.</li>
+  <li>Never auto-restart a primary that has persistence off: it comes back empty and its replicas copy the empty dataset.</li>
+</ul>
+
+<h2>Cluster in eight lines</h2>
+<ol class="steps">
+  <li>16384 slots. <code>slot = CRC16(key) mod 16384</code>.</li>
+  <li>Each primary owns slot ranges. With 3 primaries: 0–5460, 5461–10922, 10923–16383.</li>
+  <li>Hash tag: only the text inside the first non-empty <code>{…}</code> is hashed. <code>{user:42}.cart</code> and <code>{user:42}.orders</code> share a slot.</li>
+  <li>Multi-key commands and scripts need every key in one slot, otherwise you get <code>CROSSSLOT</code>.</li>
+  <li>The client caches the slot → node map (<code>CLUSTER SHARDS</code>) and talks to nodes directly, with no proxy.</li>
+  <li><code>MOVED slot host:port</code>: the slot has moved for good. Retry there and refresh the map.</li>
+  <li><code>ASK slot host:port</code>: the slot is mid-migration. Retry once there with <code>ASKING</code> and keep the map unchanged.</li>
+  <li>Failure: no reply for <code>NODE_TIMEOUT</code> → <code>PFAIL</code>; once a majority of primaries agree → <code>FAIL</code>; then a replica election promotes one replica. Async replication still means a small write-loss window.</li>
+</ol>
+
+<h2>Commands</h2>
+<pre>CLUSTER KEYSLOT &lt;key&gt;        CLUSTER NODES        CLUSTER SHARDS
+CLUSTER INFO                 CLUSTER COUNTKEYSINSLOT &lt;slot&gt;
+redis-cli -c -p 7000         <span class="c"># -c follows MOVED/ASK</span>
+READONLY                     <span class="c"># on a cluster replica connection: allow reads</span></pre>
+<p>Sources: <a href="https://redis.io/docs/latest/operate/oss_and_stack/management/replication/">Replication</a> · <a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">Cluster spec</a></p>
+</main>
+</body>
+</html>

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis Data Structures</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="0002-first-commands-and-cache-aside-in-node.html">← 0002</a> · <a href="../reference/data-structures.html">Reference: data structures</a></nav>
+
+<span class="kicker">Lesson 0003 · Video ≈18:00 → ≈31:00 · 25 min</span>
+<h1>Pick the right structure</h1>
+<p class="lede">Redis is a “data structure server”. The design skill is choosing the structure whose built-in operations already do your job.</p>
+
+<div class="win"><strong>Your win:</strong> given a product feature, you name the Redis type and the two commands you'd use, without looking. Then you model a mini BookMyShow in redis-cli.</div>
+
+<h2>1. One key, many shapes</h2>
+<p>Keys are always strings. The <em>value</em> can be any of these types, each with its own commands<sup class="cite"><a href="https://redis.io/docs/latest/develop/data-types/">[1]</a></sup>. The video demos strings, lists, hashes and geo. Sets and sorted sets matter just as much for interviews.</p>
+<div class="table-wrap"><table>
+  <tr><th>Type</th><th>Think of it as</th><th>Core commands</th><th>Classic use</th></tr>
+  <tr><td><strong>String</strong></td><td>One value (bytes, number, JSON)</td><td><code>SET GET INCR SET…NX</code></td><td>Cache entries, counters, simple locks</td></tr>
+  <tr><td><strong>List</strong></td><td>Strings in insertion order, push/pop at both ends</td><td><code>LPUSH RPUSH LPOP RPOP LRANGE LTRIM</code></td><td>Queues, stacks, “last N items”</td></tr>
+  <tr><td><strong>Hash</strong></td><td>An object: field → value</td><td><code>HSET HGET HGETALL HINCRBY</code></td><td>A user/session/product record</td></tr>
+  <tr><td><strong>Set</strong></td><td>Unordered, unique members; add/remove/test in O(1)<sup class="cite"><a href="https://redis.io/docs/latest/develop/data-types/">[1]</a></sup></td><td><code>SADD SREM SISMEMBER SINTER</code></td><td>Tags, “who liked this”, dedupe</td></tr>
+  <tr><td><strong>Sorted set</strong></td><td>Unique members, each with a score, kept ordered by score</td><td><code>ZADD ZINCRBY ZRANGE ZREMRANGEBYSCORE</code></td><td>Leaderboards, priority queues, sliding windows (Lesson 0008)</td></tr>
+  <tr><td><strong>Geo</strong></td><td>A sorted set of coordinates</td><td><code>GEOADD GEOSEARCH</code></td><td>“Stores within 5 km”</td></tr>
+  <tr><td><strong>Stream</strong></td><td>An append-only log<sup class="cite"><a href="https://redis.io/docs/latest/develop/data-types/">[1]</a></sup></td><td><code>XADD XREAD XREADGROUP</code></td><td>Event pipelines, a lightweight Kafka</td></tr>
+</table></div>
+
+<h2>2. The details that come up in interviews</h2>
+<h3>Strings</h3>
+<p>Up to 512 MB per value. <code>INCR</code>/<code>INCRBY</code> are atomic, so a thousand clients can increment the same counter without losing updates. <code>SET k v NX</code> means “only if absent”. Lesson 0009 builds a lock from it.</p>
+<h3>Lists</h3>
+<p>Pushing and popping at the <em>same</em> end gives you a stack (LIFO); opposite ends give you a queue (FIFO). The video demos the stack case: two <code>LPUSH</code>es, then <code>LPOP</code> returns the last one pushed. <code>LTRIM key 0 99</code> after each push keeps a capped “latest 100” list.</p>
+<h3>Hash vs JSON string</h3>
+<p>In Lesson 0002 you cached posts as JSON strings. A hash stores the same object field by field. Use a <strong>hash</strong> when you read or update individual fields (<code>HINCRBY product:7 stock -1</code>). Use a <strong>JSON string</strong> when you always read or write the whole object at once, as a cache usually does.</p>
+<h3>Sets and sorted sets</h3>
+<p><code>SADD</code> returns <code>1</code> if the member was new and <code>0</code> if it was already there. That makes it a one-command duplicate check. Sorted sets keep members ordered by score, so “top 10” is just <code>ZRANGE key 0 9 REV WITHSCORES</code>.</p>
+<h3>Geo</h3>
+<p><code>GEOADD key longitude latitude member</code>. Longitude comes <strong>first</strong>, a common mistake. <code>GEOSEARCH key FROMLONLAT lon lat BYRADIUS 5 km WITHDIST</code> finds members within the radius, which is the video's bike-rental station example.</p>
+<h3>Pub/Sub vs Streams</h3>
+<p>Pub/Sub is <strong>at-most-once</strong>: if a subscriber is disconnected or fails while handling a message, that message is lost for good. For stronger guarantees the docs point to Streams, which keep messages and support at-least-once delivery<sup class="cite"><a href="https://redis.io/docs/latest/develop/pubsub/">[2]</a></sup>. In an interview: use Pub/Sub for live notifications where missing one is fine, and Streams for jobs or events you can't afford to lose.</p>
+
+<div class="correction">
+  <div><span class="label">The video says</span>Redis covers time series and Bloom filters alongside the core types, and that Redis can replace Kafka/SNS/SQS.</div>
+  <div><span class="label">More precisely</span>Time series and Bloom filters ship with Redis Stack / Redis 8, not classic open-source Redis 7. “Replace Kafka” only holds for small, simple workloads (the video's own caveat). Pub/Sub alone can't replace a queue because it doesn't keep messages<sup class="cite"><a href="https://redis.io/docs/latest/develop/pubsub/">[2]</a></sup>.</div>
+</div>
+
+<h2>3. Drill: pick the structure</h2>
+<section id="pick">
+<div class="quiz" data-explain="A sorted set: the score is the points, ZINCRBY adds to it atomically, and the set stays ordered for ZRANGE … REV.">
+  <p class="q">A live game leaderboard: add points to a player and show the top 10.</p>
+  <div class="opts"><button class="opt">List type</button><button class="opt">Hash type</button><button class="opt" data-correct>Sorted set</button><button class="opt">Set type</button></div>
+</div>
+<div class="quiz" data-explain="A set: SADD returns 0 if the user already liked the post, and SCARD gives the count.">
+  <p class="q">Record which users liked a post, with no duplicates, and check “did I like it?” fast.</p>
+  <div class="opts"><button class="opt">List type</button><button class="opt">Hash type</button><button class="opt">Sorted set</button><button class="opt" data-correct>Set type</button></div>
+</div>
+<div class="quiz" data-explain="A list: LPUSH the new event, then LTRIM 0 19 to keep only the latest 20.">
+  <p class="q">Show a user's 20 most recent activity events.</p>
+  <div class="opts"><button class="opt" data-correct>List type</button><button class="opt">Hash type</button><button class="opt">Sorted set</button><button class="opt">Set type</button></div>
+</div>
+<div class="quiz" data-explain="A hash: HINCRBY on the stock field updates one field atomically without rewriting the whole product.">
+  <p class="q">A product record where checkout decrements just the <code>stock</code> field.</p>
+  <div class="opts"><button class="opt">List type</button><button class="opt" data-correct>Hash type</button><button class="opt">Sorted set</button><button class="opt">Set type</button></div>
+</div>
+<div class="quiz" data-explain="A sorted set scored by timestamp: drop entries older than the window with ZREMRANGEBYSCORE, then count with ZCARD. You'll build this in Lesson 0008.">
+  <p class="q">Count a user's requests in the last 60 seconds (sliding window).</p>
+  <div class="opts"><button class="opt">List type</button><button class="opt">Hash type</button><button class="opt" data-correct>Sorted set</button><button class="opt">Set type</button></div>
+</div>
+<div class="quiz" data-explain="Streams keep messages and support consumer groups, so a worker that was down can catch up. Pub/Sub would lose them.">
+  <p class="q">Order events must reach the email worker even if it was down for a minute.</p>
+  <div class="opts"><button class="opt">Pub/Sub broadcast channel</button><button class="opt" data-correct>Stream with group</button><button class="opt">List with LPOP</button><button class="opt">Set with SPOP</button></div>
+</div>
+<p class="score" data-for="pick"></p>
+</section>
+
+<details class="recall"><summary>Recall: which end do LPUSH and RPOP use, and what structure do they make together?</summary>
+LPUSH adds at the head and RPOP removes from the tail. Opposite ends give you a FIFO queue.</details>
+<details class="recall"><summary>Recall: what's the difference between Pub/Sub and Streams, in one line?</summary>
+Pub/Sub delivers at most once and keeps nothing. Streams keep messages and support at-least-once delivery with consumer groups.</details>
+
+<div class="assignment">
+<h3>Assignment 0003: model a mini BookMyShow in redis-cli</h3>
+<p class="meta">≈12 min · <code>docker exec -it redis-stack redis-cli</code> · watch it in RedisInsight (localhost:8001, tree view)</p>
+<ol class="steps">
+  <li><strong>Show record (hash):</strong> create <code>show:101</code> with fields <code>movie</code>, <code>screen</code>, <code>starts_at</code>, <code>seats_left</code> = 120. Decrement <code>seats_left</code> by 2 with one command.</li>
+  <li><strong>Booked seats (set):</strong> add <code>A1 A2</code> to <code>show:101:booked</code>. Try adding <code>A2</code> again. Which return value tells you it's already booked?</li>
+  <li><strong>Trending (sorted set):</strong> every booking runs <code>ZINCRBY trending 1 &lt;movie&gt;</code>. Book 3× <code>dune</code>, 1× <code>oppenheimer</code>, 2× <code>barbie</code>, then print the top 2 with scores.</li>
+  <li><strong>Activity feed (list):</strong> push 5 events onto <code>user:42:feed</code> and keep only the latest 3. Prove it with <code>LRANGE</code>.</li>
+  <li><strong>Theatres nearby (geo):</strong> add three theatres to <code>theatres</code> using real coordinates in your city. Find the ones within 5 km of where you are, with distances.</li>
+</ol>
+<p>Then paste your command history to me in the terminal for review. Bonus question: in step 2, why is the set's duplicate check <em>not</em> enough to stop two people booking A3 at the same instant if your app first runs <code>SISMEMBER</code> and only then <code>SADD</code>? (You'll fix this properly in A1.)</p>
+</div>
+
+<div class="source">
+<h3>Primary source</h3>
+<p>Redis docs: <a href="https://redis.io/docs/latest/develop/data-types/compare-data-types/">Compare data types</a> (about 10 min). It's the official guide to choosing a type.</p>
+</div>
+<div class="ask"><h3>Questions?</h3><p>Ask “when would a hash beat a JSON string for my hotel listings?” or “show me Streams consumer groups in Node”. I'll answer in the terminal.</p></div>
+
+<footer class="next">
+  <a href="0002-first-commands-and-cache-aside-in-node.html">← 0002</a>
+  <a href="0004-consistency-and-replication.html">0004 · Consistency and replication →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

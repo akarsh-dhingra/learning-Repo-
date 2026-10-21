@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rate Limiting with Redis</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="0007-hot-keys.html">← 0007</a> · <a href="../reference/locks-and-limits.html">Reference: locks &amp; limits</a></nav>
+
+<span class="kicker">Lesson 0008 · Video ≈54:00 → ≈58:00 · 25 min</span>
+<h1>Rate limiting: from a counter to a sliding window</h1>
+<p class="lede">The video builds a counter with a TTL. You'll make it atomic, see where fixed windows leak, and switch to a sorted set when that leak matters.</p>
+
+<div class="win"><strong>Your win:</strong> a running Express API that returns <code>429</code> with <code>Retry-After</code> after 10 requests per user, using a race-free Lua script, plus a sliding-window version you can explain step by step.</div>
+
+<h2>1. The video's design: fixed window</h2>
+<p>Give each user a counter key with a TTL equal to the window (for example 1 hour). On each request, <code>INCR</code> it. If the result is above N, reject. When the TTL expires the key disappears, and the next request starts again at 1. This works well because <code>INCR</code> is atomic and TTLs clean up for free<sup class="cite"><a href="https://redis.io/docs/latest/commands/incr/">[1]</a></sup>.</p>
+
+<h3>The race the INCR docs warn about</h3>
+<p>If you write it as two calls (<code>INCR</code>, then <code>EXPIRE</code> if the result was 1), a client that crashes between the two leaves a counter with <strong>no TTL</strong>. That user stays blocked forever once they pass N. The official fix is to do both in one Lua script, which Redis runs atomically<sup class="cite"><a href="https://redis.io/docs/latest/commands/incr/">[1]</a></sup>:</p>
+<pre>local n = redis.call("INCR", KEYS[1])
+if n == 1 then
+  redis.call("PEXPIRE", KEYS[1], ARGV[1])   <span class="c">-- only the first hit starts the window</span>
+end
+return { n, redis.call("PTTL", KEYS[1]) }</pre>
+<details class="recall"><summary>Why set the TTL only when n == 1, and not on every request?</summary>
+If you reset the TTL on every hit, a client that keeps calling pushes the window forward forever. Its counter never expires, so it stays blocked indefinitely even at a modest rate.</details>
+
+<h3>The leak: bursts at the boundary</h3>
+<div class="timeline">limit = 10 per minute, fixed windows [00:00–01:00) [01:00–02:00)
+00:59.5  10 requests → all allowed (window 1 count = 10)
+01:00.1  10 requests → all allowed (window 2 count = 10)
+         → 20 requests in 0.6 seconds, double the intended rate</div>
+
+<h2>2. Sliding window log (sorted set)</h2>
+<p>Store one sorted-set member per request, with the timestamp as its score. On each request, run one atomic script:</p>
+<ol class="steps">
+  <li><code>ZREMRANGEBYSCORE key -inf now-window</code>: drop requests that have aged out.</li>
+  <li><code>ZCARD key</code>: count what's left.</li>
+  <li>If the count is below the limit, <code>ZADD key now &lt;unique-id&gt;</code> and refresh the key's TTL. Allow.</li>
+  <li>Otherwise reject. Retry-after = (oldest score + window) − now.</li>
+</ol>
+<p>No boundary burst: the window always looks back exactly 60 s from <em>now</em>. The cost is memory, one entry per request in the window. That's fine at 10 per minute, but expensive at 10,000 per second per user.</p>
+
+<div class="table-wrap"><table>
+  <tr><th></th><th>Fixed window</th><th>Sliding log</th></tr>
+  <tr><td>Memory per user</td><td>One integer</td><td>One entry per request in the window</td></tr>
+  <tr><td>Boundary burst</td><td>Up to 2× the limit</td><td>None</td></tr>
+  <tr><td>Redis types</td><td>String + INCR</td><td>Sorted set</td></tr>
+</table></div>
+<p>Two more names to know for interviews: <strong>sliding window counter</strong> (blend the current and previous fixed-window counts) and <strong>token bucket</strong> (tokens refill at a steady rate, which allows short bursts). Both can also be built as one Lua script.</p>
+
+<h2>3. Run it (6 min)</h2>
+<pre>cd ~/learning-redis/labs/0008-rate-limiter
+npm start                          <span class="c"># terminal 1</span>
+npm run hammer -- fixed 13 alice   <span class="c"># terminal 2</span>
+npm run hammer -- fixed 3 bob
+npm run hammer -- sliding 13 alice</pre>
+<p>What I got when testing:</p>
+<pre>fixed as alice: 200 ×10, then 429(10s) 429(10s) 429(10s)
+fixed as bob:   200 200 200            <span class="c"># separate counter per user</span>
+sliding as alice: 200 ×10, then 429(10s) ×3</pre>
+<p>Read <code>limiters.js</code> (both scripts) and <code>server.js</code>. Note two design decisions: limits are keyed by <code>x-user-id</code> (falling back to IP), and if Redis is down the limiter <strong>fails open</strong>, serving the request rather than taking the API down.</p>
+
+<h2>4. Check yourself</h2>
+<section id="q8">
+<div class="quiz" data-explain="With two separate calls, a crash between INCR and EXPIRE leaves a counter that never expires, so the user is locked out permanently once over the limit.">
+  <p class="q">What's the bug in <code>n = INCR k; if n == 1: EXPIRE k 60</code> as two separate calls?</p>
+  <div class="opts"><button class="opt" data-correct>A crash can leave no TTL</button><button class="opt">INCR is not atomic in Redis</button><button class="opt">EXPIRE resets the stored counter value</button><button class="opt">Two calls double the stored count</button></div>
+</div>
+<div class="quiz" data-explain="Twenty: ten at the end of one window and ten at the start of the next both pass.">
+  <p class="q">Limit 10 per minute, fixed windows. Max requests allowed in any 2-second span?</p>
+  <div class="opts"><button class="opt">10</button><button class="opt" data-correct>20</button><button class="opt">11</button><button class="opt">5</button></div>
+</div>
+<div class="quiz" data-explain="Each allowed request adds a member, so memory grows with the request rate times the window length.">
+  <p class="q">The main cost of the sliding-window log compared with a fixed window is…</p>
+  <div class="opts"><button class="opt" data-correct>Memory grows with request rate</button><button class="opt">It allows bursts at boundaries</button><button class="opt">It needs a Redis Cluster</button><button class="opt">It cannot return a Retry-After</button></div>
+</div>
+<div class="quiz" data-explain="Failing closed (rejecting everything) would turn a Redis outage into a full API outage. For abuse-sensitive endpoints like login you might choose fail-closed. Know the trade-off.">
+  <p class="q">Redis is unreachable. A typical public API's rate limiter should…</p>
+  <div class="opts"><button class="opt" data-correct>Fail open and serve requests</button><button class="opt">Fail closed and reject everything</button><button class="opt">Queue requests until Redis returns</button><button class="opt">Fall back to global counter</button></div>
+</div>
+<p class="score" data-for="q8"></p>
+</section>
+
+<div class="assignment">
+<h3>Assignment 0008: build a token bucket</h3>
+<p class="meta">≈15 min · add to <code>labs/0008-rate-limiter/limiters.js</code></p>
+<ol class="steps">
+  <li>Write <code>tokenBucket(redis, id, { capacity, refillPerSec })</code> as <strong>one Lua script</strong>. Store <code>tokens</code> and <code>ts</code> in a hash. On each call, add <code>(now − ts) × refillPerSec</code> tokens (capped at capacity), take 1 if available, and save.</li>
+  <li>Mount it on <code>/bucket</code> with capacity 5 and refill 1/s. Run <code>npm run hammer -- bucket 8 alice</code>, wait 3 s, then run it again. Predict the output before you run it.</li>
+  <li>Why must <code>now</code> be passed in as an argument (or read with <code>TIME</code> inside the script) rather than computed separately on every app server? Hint: what if servers' clocks differ?</li>
+</ol>
+<p>Send me the script and your predicted vs actual output.</p>
+</div>
+
+<div class="source"><h3>Primary source</h3><p><a href="https://redis.io/docs/latest/commands/incr/">INCR</a>. Read the “Pattern: rate limiter” sections (about 6 min). They're the official write-up of the race and its Lua fix.</p></div>
+<div class="ask"><h3>Questions?</h3><p>Ask me “how would I rate-limit across a Redis Cluster?” (hint: one key per user lands in one slot, which is fine) or “how do API gateways do it?”.</p></div>
+
+<footer class="next">
+  <a href="0007-hot-keys.html">← 0007</a>
+  <a href="0009-distributed-locks-done-right.html">0009 · Distributed locks I →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

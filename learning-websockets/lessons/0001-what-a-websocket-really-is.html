@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What a WebSocket Is</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="../reference/protocol.html">Reference: protocol cheat sheet</a> · Lesson 1</nav>
+
+<span class="kicker">Lesson 0001 · Protocol · ~30 min</span>
+<h1>What a WebSocket really is</h1>
+<p class="lede">One HTTP request, one “101 Switching Protocols”, then the same TCP connection carries small binary frames in both directions until someone closes it.</p>
+
+<div class="win"><strong>Your win for this lesson:</strong> you run a WebSocket server written with <em>zero libraries</em>, read the handshake and the raw frame bytes it prints, and can decode any small frame by hand.</div>
+
+<h2>1. The problem: HTTP can't speak first</h2>
+<p>HTTP is request → response. The server answers, but only when the client asks. Every app in your mission needs the reverse: the <strong>server pushes</strong> something the moment it happens. That could be a cursor moving in Excalidraw, a trade on a CEX, a player walking past you in Gather Town, or a position update in a game.</p>
+
+<div class="table-wrap"><table>
+  <tr><th>Technique</th><th>How it works</th><th>Fits when…</th></tr>
+  <tr><td>Short polling</td><td>Client asks “anything new?” every N seconds</td><td>Updates are rare and a delay of N seconds is fine</td></tr>
+  <tr><td>Long polling</td><td>Server holds the request open until it has news, then the client re-asks</td><td>A fallback for networks that block WebSockets</td></tr>
+  <tr><td>Server-Sent Events</td><td>One long HTTP response that streams events, <em>server → client only</em><sup class="cite"><a href="https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events">[1]</a></sup></td><td>Live feeds where the client rarely talks back, e.g. a ticker</td></tr>
+  <tr><td><strong>WebSocket</strong></td><td>One persistent, <strong>full-duplex</strong> connection: either side sends at any time<sup class="cite"><a href="https://www.rfc-editor.org/rfc/rfc6455#section-1.1">[2]</a></sup></td><td>Both sides talk often and latency matters: games, collaboration, trading</td></tr>
+</table></div>
+<p>Why not just poll fast? Each poll is a full HTTP request with headers, often hundreds of bytes, to carry maybe 20 bytes of news. Polling also adds up to one poll interval of delay. A WebSocket frame adds only <strong>2–14 bytes</strong> of overhead, and the server sends it the instant something happens.</p>
+
+<h2>2. The opening handshake</h2>
+<p>A WebSocket starts life as an ordinary HTTP/1.1 GET. That's deliberate: it uses ports 80/443 and passes through existing HTTP infrastructure<sup class="cite"><a href="https://www.rfc-editor.org/rfc/rfc6455#section-1.7">[2]</a></sup>. The URL scheme is <code>ws://</code>, or <code>wss://</code> for TLS (always use <code>wss://</code> in production).</p>
+
+<pre><span class="c">// client → server</span>
+GET /chat HTTP/1.1
+Host: server.example.com
+<b>Upgrade: websocket</b>
+<b>Connection: Upgrade</b>
+<b>Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==</b>
+Sec-WebSocket-Version: 13
+Origin: http://example.com
+
+<span class="c">// server → client</span>
+<b>HTTP/1.1 101 Switching Protocols</b>
+Upgrade: websocket
+Connection: Upgrade
+<b>Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=</b></pre>
+<p>That exact pair is the example from RFC 6455 §1.3<sup class="cite"><a href="https://www.rfc-editor.org/rfc/rfc6455#section-1.3">[2]</a></sup>. The accept value is computed like this:</p>
+<pre>Sec-WebSocket-Accept = base64( sha1( Sec-WebSocket-Key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" ) )</pre>
+<p>The GUID is a fixed constant from the spec. This calculation is <strong>not authentication</strong>. It only proves the server really understood a WebSocket request and isn't some HTTP server that echoed headers back. After the <code>101</code>, HTTP is over. The same TCP socket now carries frames.</p>
+
+<div class="correction">
+  <div><span class="label">Common belief</span>“WebSockets are a separate protocol on their own port, so they skip HTTP entirely.”</div>
+  <div><span class="label">What actually happens</span>Every WebSocket begins as an HTTP request. That's why your server's <em>HTTP layer</em> is where you check auth (cookies, a token in the query string) and the <code>Origin</code> header <em>before</em> you accept the upgrade. We'll build this in a later lesson.</div>
+</div>
+
+<h2>3. Frames: the unit on the wire</h2>
+<p>After the handshake, everything is a <strong>frame</strong>. A <strong>message</strong> (what your code sees in <code>onmessage</code>) is one frame, or several fragments joined together. Here's the header from §5.2<sup class="cite"><a href="https://www.rfc-editor.org/rfc/rfc6455#section-5.2">[2]</a></sup>:</p>
+
+<figure>
+<svg viewBox="0 0 640 150" role="img" aria-label="Frame header: byte 0 holds FIN, three RSV bits and a 4-bit opcode; byte 1 holds the MASK bit and a 7-bit length; then an optional extended length, an optional 4-byte masking key, and the payload.">
+  <text class="small" x="10" y="16">byte 0</text><text class="small" x="170" y="16">byte 1</text>
+  <rect class="hot" x="10" y="24" width="30" height="40"/><text x="25" y="49" text-anchor="middle" font-size="11">FIN</text>
+  <rect class="box" x="40" y="24" width="60" height="40"/><text x="70" y="49" text-anchor="middle" font-size="11">RSV1-3</text>
+  <rect class="hot" x="100" y="24" width="60" height="40"/><text x="130" y="49" text-anchor="middle" font-size="11">opcode</text>
+  <rect class="hot" x="170" y="24" width="40" height="40"/><text x="190" y="49" text-anchor="middle" font-size="11">MASK</text>
+  <rect class="box" x="210" y="24" width="110" height="40"/><text x="265" y="49" text-anchor="middle" font-size="11">len (7 bits)</text>
+  <rect class="box" x="330" y="24" width="100" height="40" stroke-dasharray="4 3"/><text x="380" y="43" text-anchor="middle" font-size="10">ext. length</text><text x="380" y="57" text-anchor="middle" font-size="10">0, 2 or 8 B</text>
+  <rect class="box" x="440" y="24" width="90" height="40" stroke-dasharray="4 3"/><text x="485" y="43" text-anchor="middle" font-size="10">mask key</text><text x="485" y="57" text-anchor="middle" font-size="10">0 or 4 B</text>
+  <rect class="box" x="540" y="24" width="90" height="40"/><text x="585" y="49" text-anchor="middle" font-size="11">payload</text>
+  <text class="small" x="10" y="92">len 0–125 → that's the length · 126 → next 2 bytes are the length · 127 → next 8 bytes are</text>
+  <text class="small" x="10" y="112">opcode: 0x1 text · 0x2 binary · 0x0 continuation · 0x8 close · 0x9 ping · 0xA pong</text>
+  <text class="small" x="10" y="132">client→server frames MUST have MASK=1 · server→client frames MUST have MASK=0</text>
+</svg>
+<figcaption>Minimum header is 2 bytes (small server frame). Maximum is 14 bytes (8-byte length + 4-byte mask).</figcaption>
+</figure>
+
+<p>Work it out once by hand. A server sends the text <code>Hello</code>:</p>
+<ul>
+  <li>Byte 0 = <code>0x81</code> = <code>1000 0001</code>: FIN=1 (final fragment), RSV=000, opcode=1 (text).</li>
+  <li>Byte 1 = <code>0x05</code>: MASK=0 (server frames aren't masked), length=5.</li>
+  <li>Then <code>48 65 6c 6c 6f</code>, which is “Hello” in UTF-8. Total: <strong>7 bytes</strong>.</li>
+</ul>
+<p>Play with the decoder. Click the presets, then edit bytes and watch the fields change. The masked “Hello” is the RFC's own example (§5.7). The close frame came from the lab you'll run below.</p>
+<div class="framedec"></div>
+
+<h2>4. Masking: why the client XORs everything</h2>
+<p>Every client→server frame carries a random 4-byte key, and its payload is XOR-ed with it: <code>byte[i] ^ key[i % 4]</code><sup class="cite"><a href="https://www.rfc-editor.org/rfc/rfc6455#section-5.3">[2]</a></sup>. This isn't encryption, because the key is sent right next to the data. It exists to protect <strong>proxies</strong>. Without it, malicious script in a browser could send bytes that <em>look like</em> an HTTP request. A badly built caching proxy might believe them and cache a poisoned response for other users<sup class="cite"><a href="https://www.rfc-editor.org/rfc/rfc6455#section-10.3">[2]</a></sup>. Random masking means script can't choose the exact bytes on the wire. A server MUST close the connection if it gets an unmasked client frame.</p>
+
+<h2>5. Control frames: ping, pong, close</h2>
+<ul>
+  <li><strong>Ping (0x9) / Pong (0xA)</strong>: either side may ping, and the receiver MUST reply with a pong carrying the same data<sup class="cite"><a href="https://www.rfc-editor.org/rfc/rfc6455#section-5.5.2">[2]</a></sup>. Servers use this as a <strong>heartbeat</strong> to find dead connections. TCP alone can take a very long time to notice that a laptop lid closed.</li>
+  <li><strong>Close (0x8)</strong>: carries an optional 2-byte status code. The other side replies with a close, then the TCP connection ends. That's the <em>closing handshake</em>.</li>
+</ul>
+<div class="table-wrap"><table>
+  <tr><th>Code</th><th>Meaning<sup class="cite"><a href="https://www.rfc-editor.org/rfc/rfc6455#section-7.4.1">[2]</a></sup></th><th>Where you'll see it</th></tr>
+  <tr><td><code>1000</code></td><td>Normal closure</td><td>User left the Excalidraw room</td></tr>
+  <tr><td><code>1001</code></td><td>Going away</td><td>Tab closed, or your server is shutting down for a deploy</td></tr>
+  <tr><td><code>1006</code></td><td>Abnormal: no close frame received. <em>Never sent</em>, only reported locally</td><td>Wi-Fi dropped, process crashed, proxy killed an idle connection</td></tr>
+  <tr><td><code>1008</code></td><td>Policy violation</td><td>Bad auth token, rate limit exceeded</td></tr>
+  <tr><td><code>1009</code></td><td>Message too big</td><td>Client sent more than your <code>maxPayloadLength</code></td></tr>
+  <tr><td><code>1011</code></td><td>Internal server error</td><td>Unhandled exception in your handler</td></tr>
+</table></div>
+<p>Apps can also use their own codes in the <strong>4000–4999</strong> range, e.g. <code>4001 room full</code>.</p>
+
+<h2>6. Lab: a WebSocket server with zero libraries</h2>
+<p>Open <code>~/learning-websockets/labs/0001-handshake-by-hand/server.mjs</code> and read it top to bottom. It's about 70 lines: <code>node:net</code> for raw TCP, <code>node:crypto</code> for SHA-1, and everything from sections 2–5. Then run it:</p>
+<pre>cd ~/learning-websockets/labs/0001-handshake-by-hand
+node server.mjs          <span class="c"># terminal 1</span>
+node client.mjs          <span class="c"># terminal 2: uses Node's built-in WebSocket client</span></pre>
+<p>What you should see in terminal 1 (abbreviated, from a real run on your machine):</p>
+<pre>── HTTP request from client ──
+GET / HTTP/1.1
+connection: upgrade
+upgrade: websocket
+sec-websocket-key: xwM7i0uXSzAPs/xuYNWAPg==
+sec-websocket-version: 13
+sec-websocket-extensions: permessage-deflate; client_max_window_bits
+── frame bytes ── 81 95 51 f7 44 bc 39 92 …
+FIN=true opcode=1 MASK=true len=21
+text: hello from the client
+── frame bytes ── 88 82 a6 f1 ad 20 a5 19 …
+close code: 1000</pre>
+<p>Notice <code>95</code> in byte 1: <code>1001 0101</code> means MASK=1 and length=21. Notice also that the client offered <code>permessage-deflate</code> compression and our server ignored it. That's allowed: the server simply doesn't list it in the response, so it isn't used. Now try it from a browser: open any page's dev console and run</p>
+<pre>const s = new WebSocket("ws://localhost:8081");
+s.onmessage = (e) => console.log(e.data);
+s.onopen = () => s.send("hi from chrome");</pre>
+
+<h2>7. Recall first, then check</h2>
+<p>Answer out loud <em>before</em> opening each one. Answering from memory is what moves knowledge from “I've seen it” to “I know it”.</p>
+<details class="recall"><summary>Walk through the handshake: which headers matter, and what status code?</summary>
+Client sends a GET with <code>Upgrade: websocket</code>, <code>Connection: Upgrade</code>, <code>Sec-WebSocket-Key</code> and <code>Sec-WebSocket-Version: 13</code>. Server replies <code>101 Switching Protocols</code> with <code>Sec-WebSocket-Accept = base64(sha1(key + GUID))</code>. After that the TCP socket carries frames.</details>
+<details class="recall"><summary>What's in the first two bytes of every frame?</summary>
+Byte 0: FIN, RSV1–3, opcode (4 bits). Byte 1: MASK bit plus a 7-bit length, where 126 or 127 means an extended length follows.</details>
+<details class="recall"><summary>Who masks, and why?</summary>
+Only the client masks, on every frame, with a fresh random key. This stops browser script from writing chosen bytes that a broken proxy could mistake for HTTP and cache (cache poisoning).</details>
+<details class="recall"><summary>Your user's phone drops off the subway Wi-Fi. What close code does the server see, and how does it find out?</summary>
+1006 (abnormal, no close frame), and often only after a heartbeat ping goes unanswered or an idle timeout fires. TCP alone may not notice for minutes.</details>
+
+<section id="quiz1">
+<h3>Check yourself</h3>
+<div class="quiz" data-explain="The upgrade is a normal HTTP request answered with 101. That's why auth and Origin checks happen in your HTTP handler before you accept.">
+  <p class="q">A WebSocket connection begins with…</p>
+  <div class="opts">
+    <button class="opt" data-correct>An HTTP GET answered with 101</button>
+    <button class="opt">A UDP packet to port 8080</button>
+    <button class="opt">A TLS handshake on port 9443</button>
+    <button class="opt">An HTTP POST answered with 200</button>
+  </div>
+</div>
+<div class="quiz" data-explain="0x82 = 1000 0010: FIN=1, opcode=2 (binary). 0x03 = MASK 0, length 3. An unmasked frame means it came from the server.">
+  <p class="q">You see bytes <code>82 03 01 02 03</code>. What is it?</p>
+  <div class="opts">
+    <button class="opt">A masked text frame from a client</button>
+    <button class="opt">A ping frame carrying three payload bytes</button>
+    <button class="opt" data-correct>An unmasked binary frame from a server</button>
+    <button class="opt">A fragment with more frames to come</button>
+  </div>
+</div>
+<div class="quiz" data-explain="Masking defends against cache poisoning of intermediaries (RFC 6455 §10.3). It isn't encryption: the key travels with the frame. TLS (wss://) provides confidentiality.">
+  <p class="q">Client-to-server masking exists mainly to…</p>
+  <div class="opts">
+    <button class="opt">Encrypt payloads when TLS is unavailable</button>
+    <button class="opt">Compress repeated payloads much more efficiently</button>
+    <button class="opt">Let the server verify client identity</button>
+    <button class="opt" data-correct>Stop proxies being fooled into caching</button>
+  </div>
+</div>
+<div class="quiz" data-explain="1006 is reserved for 'closed without a close frame'. It's reported locally and never sent on the wire, so it typically means a network drop or a crash.">
+  <p class="q">Your logs show many closes with code 1006. Most likely…</p>
+  <div class="opts">
+    <button class="opt">Clients sent messages far too big</button>
+    <button class="opt" data-correct>Connections died without a closing handshake</button>
+    <button class="opt">Your server rejected tokens as invalid</button>
+    <button class="opt">Users closed tabs the normal way</button>
+  </div>
+</div>
+<div class="quiz" data-explain="The 7-bit field can only hold 0–125 directly. 126 means a 16-bit length follows (up to 65,535), and 127 means a 64-bit length follows.">
+  <p class="q">A 300-byte server text frame. What's byte 1, and what follows?</p>
+  <div class="opts">
+    <button class="opt">0x7F, then an 8-byte length field</button>
+    <button class="opt">0xFE, then a 4-byte masking key</button>
+    <button class="opt" data-correct>0x7E, then a 2-byte length field</button>
+    <button class="opt">0x2C, then the payload bytes directly</button>
+  </div>
+</div>
+<div class="quiz" data-explain="SSE is one-way server→client over plain HTTP and auto-reconnects. A read-only ticker fits it well. Orders still go over normal HTTP requests. A WebSocket is also fine, but it isn't required.">
+  <p class="q">A read-only CEX price ticker page, no user input. Simplest fitting tech?</p>
+  <div class="opts">
+    <button class="opt">Short polling every fifty milliseconds</button>
+    <button class="opt" data-correct>Server-Sent Events over plain HTTP</button>
+    <button class="opt">WebRTC data channel between browsers</button>
+    <button class="opt">Long polling with sticky sessions</button>
+  </div>
+</div>
+<p class="score" data-for="quiz1"></p>
+</section>
+
+<h2>8. System-design rep</h2>
+<p>Set a 60-second timer and answer out loud: <em>“Why does Excalidraw use WebSockets for live collaboration instead of polling an API?”</em></p>
+<details class="recall"><summary>A strong answer covers…</summary>
+<ul>
+  <li>Both directions are chatty: every user's cursor and edits go up, and everyone else's come down. That's full-duplex traffic.</li>
+  <li>Latency: a push arrives the instant it happens, while polling adds up to one poll interval.</li>
+  <li>Overhead: 2–14 bytes per frame versus full HTTP headers per poll. At 20–30 cursor updates/sec per user, that difference dominates.</li>
+  <li>The cost: a long-lived, <em>stateful</em> connection pinned to one server process. That's what makes scaling harder (lesson 0003).</li>
+</ul></details>
+
+<div class="assignment">
+<h3>Assignment A1: grow the raw server</h3>
+<p class="meta">~30–45 min · labs/0001-handshake-by-hand/server.mjs</p>
+<ol>
+  <li>Support payloads up to 65,535 bytes in <strong>both</strong> <code>decodeFrame</code> and <code>encodeTextFrame</code>, using the 126 + 2-byte length form. Test it by changing the client to send <code>"x".repeat(1000)</code>.</li>
+  <li>When the server receives a ping (opcode 0x9), reply with a pong (0xA) carrying the same payload.</li>
+  <li>Reject the connection with <code>HTTP/1.1 403 Forbidden</code> if the request's <code>Origin</code> header exists and isn't <code>http://localhost:3000</code>. Then explain in one sentence why the browser's console test above now fails.</li>
+  <li>Write down: one bug this server still has that a real library handles. Hint: what if one <code>data</code> event holds 1.5 frames?</li>
+</ol>
+<p>Paste your diff and answers in the terminal and I'll review them.</p>
+</div>
+
+<div class="source">
+<h3>Primary source</h3>
+<p>Read <a href="https://www.rfc-editor.org/rfc/rfc6455#section-1.2">RFC 6455 §1.2–1.3</a> (handshake overview, ~10 min) and <a href="https://www.rfc-editor.org/rfc/rfc6455#section-5.2">§5.2 Base Framing Protocol</a>. RFCs read better than you'd expect. Then skim MDN's <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API/Writing_WebSocket_servers">Writing WebSocket servers</a>, which covers the same ground in tutorial form.</p>
+</div>
+
+<div class="ask">
+<h3>Stuck on anything?</h3>
+<p>Ask me in the terminal. For example: “why can't the browser send raw TCP instead?”, “what does fragmentation look like in practice?”, “is HTTP/2 or HTTP/3 relevant here?”, or “explain the quiz question I got wrong”.</p>
+</div>
+
+<footer class="next">
+  <a href="index.html">← Course map</a>
+  <a href="0002-node-vs-bun-measured.html">Next: Lesson 0002 · Node vs Bun, measured →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/frame-decoder.js"></script>
+</body>
+</html>

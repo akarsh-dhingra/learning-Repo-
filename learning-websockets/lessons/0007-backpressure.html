@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backpressure &amp; Slow Consumers</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="../reference/backend-patterns.html">Reference: backend patterns</a> · Lesson 7</nav>
+
+<span class="kicker">Lesson 0007 · Build · ~50 min</span>
+<h1>Backpressure &amp; slow consumers</h1>
+<p class="lede">One user on hotel Wi-Fi can't read as fast as you send. If you keep queueing, their buffer eats your server's memory. Decide what to drop, and when to cut them loose.</p>
+
+<div class="win"><strong>You'll build:</strong> cursor batching on a tick, skip-when-slow for droppable messages, a hard limit that terminates hopeless sockets (they resume via 0006), and a <code>/stats</code> endpoint. Then you'll watch a real stuck client get kicked. <strong>Done when:</strong> 3/3 checks pass.</div>
+
+<h2>1. Where the bytes go</h2>
+<p><code>ws.send()</code> doesn't put bytes on the network. It puts them in a <strong>per-socket send buffer</strong> that drains as fast as the <em>client</em> reads. A fast server plus a slow reader means a buffer that grows without limit. You can see it with <code>ws.getBufferedAmount()</code> (Bun) or <code>ws.bufferedAmount</code> (ws / browser). Bun also tells you on every send: <code>-1</code> means queued under backpressure, and <code>0</code> means dropped<sup class="cite"><a href="https://bun.com/docs/runtime/http/websockets">[1]</a></sup>.</p>
+<div class="table-wrap"><table>
+  <tr><th>Message kind</th><th>Policy when the client is slow</th><th>Why</th></tr>
+  <tr><td>Ephemeral (cursors, positions, typing)</td><td><strong>Coalesce, then skip</strong> for that socket</td><td>Latest value wins; a stale cursor has zero value</td></tr>
+  <tr><td>Durable (strokes, chat, orders)</td><td><strong>Never skip</strong>; past a hard limit, <strong>disconnect</strong></td><td>A gap corrupts state. Resume (0006) is the recovery path</td></tr>
+</table></div>
+
+<h2>2. Build it (continue in build/rooms)</h2>
+<h3>Step 1: coalesce cursors and flush on a tick</h3>
+<p>Instead of publishing every cursor message, remember only the latest per user, and every 50 ms send <strong>one</strong> <code>cursors</code> batch per room. 30 moves/sec/user in becomes at most 20 batches/sec/room out, however many users are moving.</p>
+<pre><span class="c">// handler: just remember</span>
+.on("cursor", z.object({ x: z.number(), y: z.number() }), ({ ws, data }) =&gt; {
+  getRoom(ws.data.room).cursors.set(ws.data.user.id, { userId: ws.data.user.id, ...data });
+})
+
+<span class="c">// tick: one batch per room, serialised once, skipped for slow sockets</span>
+setInterval(() =&gt; {
+  for (const room of rooms.values()) {
+    if (room.cursors.size === 0) continue;
+    const batch = JSON.stringify({ type: "cursors", data: [...room.cursors.values()] });
+    room.cursors.clear();
+    for (const ws of room.sockets) {
+      if (ws.getBufferedAmount() &gt; 64 * 1024) { stats.cursorDrops++; continue; }   <span class="c">// SOFT limit</span>
+      ws.send(batch);
+    }
+  }
+}, 50);</pre>
+<p>Rooms now need a <code>sockets: Set</code> (add in <code>open</code>, delete in <code>close</code>) because you're sending per socket. The batch goes to everyone, sender included, so the client skips its own <code>userId</code>. That keeps “serialise once”.</p>
+
+<h3>Step 2: hard limit for durable events</h3>
+<pre>function kickSlowConsumers(roomId: string) {
+  for (const ws of getRoom(roomId).sockets) {
+    if (ws.getBufferedAmount() &gt; 1024 * 1024) {      <span class="c">// HARD limit: 1 MB behind</span>
+      stats.kicked++;
+      ws.terminate();   <span class="c">// close() would queue a close frame BEHIND the backlog</span>
+    }
+  }
+}
+<span class="c">// call it right after every durable publish (stroke.added, scene.cleared)</span></pre>
+<p>Set Bun's <code>backpressureLimit</code> <em>above</em> your hard limit (e.g. 4 MB) as a safety net. Past it, Bun silently <strong>drops</strong> messages for that socket, which is the one outcome you never want for durable events.</p>
+
+<h3>Step 3: <code>/stats</code></h3>
+<pre>const stats = { connections: 0, cursorBatches: 0, cursorDrops: 0, kicked: 0 };
+if (url.pathname === "/stats") return Response.json(stats);</pre>
+
+<h2>3. Watch it happen</h2>
+<pre>bun server.ts                                              <span class="c"># terminal 1</span>
+node ~/learning-websockets/labs/0007-backpressure/slow-client.mjs demo   <span class="c"># terminal 2: handshakes, then never reads</span>
+bun  ~/learning-websockets/labs/0007-backpressure/flood.ts demo          <span class="c"># terminal 3: ~12 MB of strokes</span></pre>
+<p>On your machine the reference server logged <code>kicking slow consumer slowpoke: 1064408 bytes queued</code>, and the slow client printed <code>KICKED: server dropped the slow client (EPIPE)</code>. Note the slow client must run under <strong>Node</strong>: Bun's <code>node:net</code> keeps reading even when paused, so it isn't actually slow. That's a good reminder to verify your test tools too.</p>
+<pre>URL=http://localhost:8080 bun test ~/learning-websockets/labs/0007-backpressure/check.test.ts</pre>
+<p>Update your client from 0006 to handle <code>cursors</code> batches (see <code>labs/0007-backpressure/public/index.html</code>).</p>
+
+<h2>4. Check yourself</h2>
+<section id="quiz7">
+<div class="quiz" data-explain="Skipping a cursor batch costs nothing: the next one (50 ms later) carries the latest position anyway.">
+  <p class="q">A socket has 200 KB buffered. A cursor batch is due. You…</p>
+  <div class="opts">
+    <button class="opt" data-correct>Skip this batch for that socket</button>
+    <button class="opt">Queue it, since order matters most</button>
+    <button class="opt">Terminate the socket right away now</button>
+    <button class="opt">Send it to another room instead</button>
+  </div>
+</div>
+<div class="quiz" data-explain="close() sends a close frame, which joins the end of a 1 MB queue the client isn't reading. terminate() drops the TCP connection immediately.">
+  <p class="q">Why <code>terminate()</code> and not <code>close(4008)</code> for a stuck client?</p>
+  <div class="opts">
+    <button class="opt">close codes above 4000 are always illegal</button>
+    <button class="opt" data-correct>The close frame waits behind the backlog</button>
+    <button class="opt">terminate also deletes all the user's strokes</button>
+    <button class="opt">close would notify every other room member</button>
+  </div>
+</div>
+<div class="quiz" data-explain="With a tick, the outbound rate per room is fixed (20 batches/s) no matter how many cursor messages arrive. That's what makes the cost predictable.">
+  <p class="q">10 users each move 60 times/sec. With a 50 ms tick, each user receives about…</p>
+  <div class="opts">
+    <button class="opt">600 cursor messages per second</button>
+    <button class="opt">60 cursor messages per second</button>
+    <button class="opt" data-correct>20 cursor batches per second</button>
+    <button class="opt">10 cursor batches per second</button>
+  </div>
+</div>
+<p class="score" data-for="quiz7"></p>
+</section>
+
+<h2>5. System-design rep</h2>
+<p>60 seconds: <em>“On your CEX, a market-data client on a bad connection falls behind on the BTC order book. What do you do?”</em></p>
+<details class="recall"><summary>A strong answer covers…</summary>
+<ul>
+  <li>Order-book diffs are durable: skipping one silently corrupts the client's book. So never drop selectively. Past a buffer limit, disconnect.</li>
+  <li>The client reconnects and resyncs from a snapshot (lesson 0011). It's cheaper than buffering minutes of diffs.</li>
+  <li>Offer a lighter stream for weak clients: top-20 levels at 100 ms (a conflated snapshot) instead of every diff. Binance does exactly this with its partial-depth streams.</li>
+  <li>Monitor <code>kicked</code> and buffer sizes. A spike means a network problem or a too-chatty stream.</li>
+</ul></details>
+
+<div class="assignment">
+<h3>Assignment A7</h3>
+<p class="meta">~30 min · build/rooms</p>
+<ol>
+  <li>Get the 3 checks green against your server.</li>
+  <li>Make the tick adaptive: if a room has more than 30 sockets, flush every 100 ms instead of 50 ms. Measure <code>cursorBatches</code> before and after with the flood script.</li>
+  <li>In one paragraph: why is “just raise the buffer limit to 100 MB” a bad fix?</li>
+</ol>
+</div>
+
+<div class="source">
+<h3>Primary source</h3>
+<p>The backpressure section of the <a href="https://bun.com/docs/runtime/http/websockets">Bun WebSocket docs</a> (<code>send()</code> return values, <code>drain</code>, <code>backpressureLimit</code>), and MDN on <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/bufferedAmount"><code>WebSocket.bufferedAmount</code></a> for the client side.</p>
+</div>
+
+<div class="ask"><h3>Stuck on anything?</h3><p>Ask me in the terminal. For example: “how do I apply backpressure to the <em>sender</em> instead?” or “what does Socket.IO's volatile emit do?”</p></div>
+
+<footer class="next">
+  <a href="0006-auth-heartbeat-resume.html">← Lesson 0006 · Auth &amp; resume</a>
+  <a href="0008-redis-backplane.html">Next: Lesson 0008 · Many nodes with a Redis backplane →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

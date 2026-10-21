@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Operating the Socket Layer</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="../reference/backend-patterns.html">Reference: backend patterns</a> · Lesson 12</nav>
+
+<span class="kicker">Lesson 0012 · Build + measure · ~90 min</span>
+<h1>Operating it: metrics, drains, load tests</h1>
+<p class="lede">You can't run what you can't see. Add the metrics that matter, make deploys boring, then load-test the 0008 cluster until it breaks, and find out <em>why</em> it broke.</p>
+
+<div class="win"><strong>You'll build:</strong> a Prometheus <code>/metrics</code> endpoint, graceful drain (failing health checks, refusing new sockets, closing existing ones spread over a window), and a WebSocket load generator. <strong>Done when:</strong> 2/2 checks pass, and you've reproduced the room-affinity result below on your machine.</div>
+
+<h2>1. The metrics that matter</h2>
+<div class="table-wrap"><table>
+  <tr><th>Metric</th><th>Type</th><th>Alert when…</th></tr>
+  <tr><td><code>ws_connections</code></td><td>gauge</td><td>drops sharply (mass disconnect), or one node is far above the others (bad balancing)</td></tr>
+  <tr><td><code>ws_messages_in_total</code> / <code>_out_total</code></td><td>counter</td><td>out/in ratio jumps (a fan-out explosion)</td></tr>
+  <tr><td><code>ws_kicked_total</code>, <code>ws_cursor_drops_total</code></td><td>counter</td><td>rate rises: clients or network can't keep up (0007)</td></tr>
+  <tr><td><code>ws_max_buffered_bytes</code></td><td>gauge</td><td>approaches your hard limit</td></tr>
+  <tr><td><code>nodejs_eventloop_lag_ms</code></td><td>gauge</td><td>&gt; ~50 ms: the process is CPU-bound and every socket on it is lagging</td></tr>
+  <tr><td><code>process_resident_memory_bytes</code></td><td>gauge</td><td>grows with no growth in connections (a leak)</td></tr>
+</table></div>
+<p>Prometheus text format is just lines<sup class="cite"><a href="https://prometheus.io/docs/instrumenting/exposition_formats/">[1]</a></sup>:</p>
+<pre># HELP ws_connections Open WebSocket connections
+# TYPE ws_connections gauge
+ws_connections{node="node-1"} 1667</pre>
+<p>Event-loop lag is the cheapest health signal there is. Schedule a 500 ms timer and record how late it fires.</p>
+
+<h2>2. Graceful drain: making deploys boring</h2>
+<ol class="steps">
+  <li>On <code>SIGTERM</code> (what Kubernetes and systemd send), set <code>draining = true</code>.</li>
+  <li><code>/healthz</code> returns <strong>503</strong>, so the load balancer stops sending <em>new</em> connections.</li>
+  <li>New upgrades get <strong>503</strong>.</li>
+  <li>Existing sockets are closed with <strong><code>1001</code> “server restarting”</strong>, <em>spread over</em> <code>DRAIN_MS</code>. Dropping 50k at once makes 50k reconnects in the same second: a reconnect storm aimed at your remaining nodes.</li>
+  <li>Clients reconnect with jittered backoff (0006), land on healthy nodes, and resume by seq with nothing lost, because state is in Redis (0008).</li>
+  <li>Exit. Set the orchestrator's grace period longer than <code>DRAIN_MS</code>.</li>
+</ol>
+<pre>all.forEach((ws, i) =&gt; setTimeout(() =&gt; ws.close(1001, "server restarting"), (i / all.length) * DRAIN_MS));</pre>
+
+<h2>3. Build it</h2>
+<p>Continue <code>build/rooms</code> from 0008. Reference: <code>labs/0012-operating-it/server.ts</code> (the diff from 0008 is about 70 lines: <code>metrics()</code>, <code>drain()</code>, a few counters), plus <code>loadtest.ts</code>.</p>
+<pre>cd ~/learning-websockets/labs/0012-operating-it
+./start-cluster.sh                 <span class="c"># 3 nodes + Redis, as in 0008</span>
+curl localhost:8081/metrics
+bun test check.test.ts             <span class="c"># drains node 3 at the end: ./stop-cluster.sh &amp;&amp; ./start-cluster.sh</span></pre>
+
+<h2>4. Load test: the measurement that matters</h2>
+<p><code>loadtest.ts</code> spreads N clients across the three nodes. Every client sends a cursor 10×/s, and one in ten draws a stroke every 2 s. It reports how long strokes take to reach <em>other</em> clients, plus per-node metrics. Real runs on your M4, 20 clients per room:</p>
+<div class="table-wrap"><table>
+  <tr><th>Run</th><th>Sockets</th><th>Routing</th><th>Stroke delivery p50 / p99</th><th>Node loop lag</th></tr>
+  <tr><td>A</td><td>3,000</td><td>round-robin</td><td>15 ms / 35 ms</td><td>&lt; 1 ms</td></tr>
+  <tr><td>B</td><td>5,000</td><td>round-robin</td><td><strong>6,784 ms / 9,086 ms</strong></td><td>&lt; 5 ms</td></tr>
+  <tr><td>C</td><td>5,000</td><td><strong>room affinity</strong></td><td><strong>43 ms / 217 ms</strong></td><td>&lt; 5 ms</td></tr>
+</table></div>
+
+<h3>Debugging run B: where did 6.8 seconds go?</h3>
+<p>This is the actual investigation, step by step. Practise reading it, because this is the job:</p>
+<ol class="steps">
+  <li><strong>Server CPU?</strong> Loop lag stayed under 5 ms and the nodes sat at ~30–60% CPU. Not the nodes.</li>
+  <li><strong>Server send buffers?</strong> <code>ws_max_buffered_bytes</code> = 0 and no kicks. The nodes weren't waiting on clients.</li>
+  <li><strong>The load generator?</strong> Plausible at ~90% CPU, but splitting it into 2 and then 4 processes didn't help, and the four generators reported <em>identical</em> latencies. That points to a shared queue upstream of all of them.</li>
+  <li><strong>Redis?</strong> <code>redis-cli -p 6390 client list</code> showed each node's <em>subscriber</em> connection with <code>omem</code> of <strong>2.5–11.6 MB</strong>: Pub/Sub output Redis was holding because the subscriber hadn't read it yet. Strokes were queued behind megabytes of cursor batches.</li>
+  <li><strong>Confirm:</strong> the same run with cursors off (<code>CURSOR_HZ=0</code>) gave p50 37 ms. The backplane was carrying traffic that didn't need to cross nodes.</li>
+</ol>
+<p><strong>Why:</strong> with round-robin, every room has users on all three nodes, so every node subscribes to every room and every cursor batch crosses the backplane to all of them. Fan-out traffic grows with <em>nodes × rooms</em>, the thing lesson 0003 warned about. <strong>Fix:</strong> route by room. <code>AFFINITY=1</code> sends a room's clients to the node <code>hash(room)</code> picks, just like nginx's <code>hash $arg_room consistent</code> (in <code>nginx.conf</code>). Each node then only hears its own rooms: about 3× less backplane traffic, and p50 back to 43 ms.</p>
+<div class="correction">
+  <div><span class="label">Production danger you just met</span>Redis's default <code>client-output-buffer-limit pubsub 32mb 8mb 60</code> <strong>disconnects</strong> a subscriber whose buffer passes 32 MB, or stays above 8 MB for 60 s<sup class="cite"><a href="https://redis.io/docs/latest/develop/reference/clients/">[2]</a></sup>. Run B was a few minutes from a node silently losing its whole backplane.</div>
+  <div><span class="label">What to do</span>Graph <code>omem</code> of your subscriber connections. Keep chatty ephemeral traffic off the backplane (affinity, or node-local fan-out), and make sure clients detect seq gaps and resume, because one day a subscriber <em>will</em> be dropped.</div>
+</div>
+<pre>bun loadtest.ts 3000 150 15                 <span class="c"># run A</span>
+bun loadtest.ts 5000 250 15                 <span class="c"># run B   (clean between runs: redis-cli -p 6390 --scan --pattern 'room:*' | xargs redis-cli -p 6390 del)</span>
+AFFINITY=1 bun loadtest.ts 5000 250 15      <span class="c"># run C</span></pre>
+<p><strong>Limits to know when load-testing from one laptop:</strong> each client socket uses an ephemeral port, and macOS gives you 49152–65535 (about 16k per destination). Your file-descriptor limit is in <code>ulimit -n</code>. Beyond ~10k sockets, test from several machines, with a dedicated tool such as k6, which has WebSocket support<sup class="cite"><a href="https://grafana.com/docs/k6/latest/using-k6/protocols/websockets/">[3]</a></sup>.</p>
+
+<h2>5. Check yourself</h2>
+<section id="quiz12">
+<div class="quiz" data-explain="A failing health check tells the load balancer to stop routing new connections. Without it, new users keep landing on a node that is about to close them.">
+  <p class="q">Why does <code>/healthz</code> return 503 while draining?</p>
+  <div class="opts">
+    <button class="opt">To make all clients close their sockets</button>
+    <button class="opt" data-correct>So the LB sends new users elsewhere</button>
+    <button class="opt">To force Redis to drop the node</button>
+    <button class="opt">Because Bun requires it on every SIGTERM</button>
+  </div>
+</div>
+<div class="quiz" data-explain="Low loop lag and empty send buffers rule out the node; a huge omem on the subscriber connection shows the queue sits in Redis, between publish and the node reading it.">
+  <p class="q">Loop lag is tiny, send buffers are empty, but Redis shows 10 MB <code>omem</code> on a subscriber. The bottleneck is…</p>
+  <div class="opts">
+    <button class="opt">The clients' browsers rendering too slowly</button>
+    <button class="opt" data-correct>Backplane traffic the node hasn't consumed</button>
+    <button class="opt">The Lua script assigning seq numbers</button>
+    <button class="opt">The load balancer's idle read timeout</button>
+  </div>
+</div>
+<div class="quiz" data-explain="If every node holds members of every room, every message is delivered to every node. Affinity makes most rooms single-node, so their traffic barely crosses the backplane.">
+  <p class="q">Room affinity cut latency because…</p>
+  <div class="opts">
+    <button class="opt">Strokes no longer need sequence numbers</button>
+    <button class="opt">Clients connect faster with consistent hashing</button>
+    <button class="opt" data-correct>Each node hears only its rooms</button>
+    <button class="opt">Redis stores less data per room</button>
+  </div>
+</div>
+<p class="score" data-for="quiz12"></p>
+</section>
+
+<h2>6. System-design rep</h2>
+<p>60 seconds: <em>“What's on your socket-layer dashboard, and what wakes someone up at 3 am?”</em></p>
+<details class="recall"><summary>A strong answer covers…</summary>
+<ul>
+  <li>Dashboard: connections per node, connect/disconnect rate, messages in/out, delivery latency (synthetic probes), loop lag, memory per socket, kicks/drops, backplane subscriber buffer, Redis health.</li>
+  <li>Page on: a sudden connection drop across nodes, reconnect rate far above baseline (a storm), probe latency p99 over SLO, or loop lag above 100 ms sustained.</li>
+  <li>Ticket, don't page: a slow rise in kicks (often one ISP), memory growth (a leak), and imbalance between nodes.</li>
+</ul></details>
+
+<div class="assignment">
+<h3>Assignment A12</h3>
+<p class="meta">~60 min · build/rooms</p>
+<ol>
+  <li>Pass both checks against your build.</li>
+  <li>Add a <code>ws_delivery_latency_ms</code> histogram: a synthetic “probe” socket per node sends a stroke every 5 s to a hidden room and records how long it takes to arrive back.</li>
+  <li>Reproduce runs A, B and C. Then try one more fix of your own (for example, node-local fan-out for cursors plus Redis only for <em>other</em> nodes) and report the numbers.</li>
+</ol>
+</div>
+
+<div class="source">
+<h3>Primary source</h3>
+<p>Redis docs on <a href="https://redis.io/docs/latest/develop/reference/clients/">client handling and output-buffer limits</a>, the exact mechanism behind run B. Then <a href="https://grafana.com/docs/k6/latest/using-k6/protocols/websockets/">k6's WebSocket docs</a> for load testing at larger scale.</p>
+</div>
+
+<div class="ask"><h3>Stuck on anything?</h3><p>Ask me in the terminal. For example: “how do I ship these metrics to Grafana?”, “what does a Kubernetes preStop hook look like for drain?”, or paste your load-test output.</p></div>
+
+<footer class="next">
+  <a href="0011-orderbook-feed.html">← Lesson 0011 · CEX order book</a>
+  <a href="capstone.html">Next: the Capstone →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

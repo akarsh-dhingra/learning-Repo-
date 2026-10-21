@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Gather-Style World</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+  svg .bar-on { fill: var(--accent); } svg .bar-off { fill: var(--muted); } svg .grid { stroke: var(--rule); }
+  .legend { display: flex; gap: 1.2rem; font-size: .85rem; color: var(--muted); margin: .4rem 0 0; }
+  .legend i { display: inline-block; width: .8rem; height: .8rem; border-radius: 2px; margin-right: .35rem; vertical-align: -1px; }
+</style>
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="../reference/backend-patterns.html">Reference: backend patterns</a> · Lesson 9</nav>
+
+<span class="kicker">Lesson 0009 · Build · ~75 min</span>
+<h1>A Gather-style world: ticks &amp; interest management</h1>
+<p class="lede">Rooms where everyone sees everyone don't survive 300 people. Make the server authoritative, send updates on a fixed tick, and tell each player only about what's near them.</p>
+
+<div class="win"><strong>You'll build:</strong> a 2D world server (separate from the whiteboard) with server-authoritative movement, a 10 Hz tick, a spatial grid, per-player <code>enter</code>/<code>moves</code>/<code>leave</code> deltas and proximity chat, plus a canvas client and a bot swarm to measure it. <strong>Done when:</strong> 7/7 checks pass and you've reproduced the numbers below.</div>
+
+<h2>1. Three game-server ideas you need</h2>
+<ol class="steps">
+  <li><strong>Server-authoritative.</strong> Clients send <em>intent</em> (“I want to be at x,y”). The server clamps it (max 50 px per move, inside the world) and its answer is the truth. Never trust client positions in anything with stakes.</li>
+  <li><strong>Fixed tick.</strong> Apply input as it arrives, but <em>send</em> state once per tick (100 ms here). Outbound messages per player per second are capped at the tick rate, however many moves happen.</li>
+  <li><strong>Interest management.</strong> A player only receives players within <code>RADIUS</code>. Find them fast with a <strong>spatial grid</strong>: cell size = radius, so neighbours are always in the 3×3 cells around you. No O(N²) distance checks.</li>
+</ol>
+
+<h2>2. Measured on your machine</h2>
+<p><code>bun bots.ts</code> spawns wandering bots that each move 10×/s. Same server, with <code>INTEREST=off</code> (everyone sees everyone) vs on (radius 300):</p>
+<figure>
+<svg viewBox="0 0 600 220" role="img" aria-label="Server egress in MB per second. 300 bots: 21.0 with interest off, 2.0 with it on. 1000 bots: 226 off, 20.4 on.">
+  <line class="grid" x1="70" y1="180" x2="590" y2="180"/><line class="grid" x1="70" y1="110" x2="590" y2="110"/><line class="grid" x1="70" y1="40" x2="590" y2="40"/>
+  <text class="small" x="62" y="184" text-anchor="end">0</text><text class="small" x="62" y="114" text-anchor="end">100</text><text class="small" x="62" y="44" text-anchor="end">200</text>
+  <g><title>300 bots, interest OFF: 21.01 MB/s</title><rect class="bar-off" x="120" y="165.3" width="60" height="14.7" rx="4"/></g><text class="small" x="150" y="160" text-anchor="middle">21.0</text>
+  <g><title>300 bots, interest ON: 2.01 MB/s</title><rect class="bar-on" x="184" y="178.6" width="60" height="1.4" rx="1"/></g><text class="small" x="214" y="173" text-anchor="middle">2.0</text>
+  <g><title>1000 bots, interest OFF: 226.41 MB/s</title><rect class="bar-off" x="370" y="21.5" width="60" height="158.5" rx="4"/></g><text class="small" x="400" y="16" text-anchor="middle">226</text>
+  <g><title>1000 bots, interest ON: 20.37 MB/s</title><rect class="bar-on" x="434" y="165.7" width="60" height="14.3" rx="4"/></g><text class="small" x="464" y="160" text-anchor="middle">20.4</text>
+  <text class="small" x="182" y="200" text-anchor="middle">300 bots</text><text class="small" x="432" y="200" text-anchor="middle">1,000 bots</text>
+</svg>
+<p class="legend"><span><i style="background:var(--muted)"></i>interest management off</span><span><i style="background:var(--accent)"></i>on (radius 300)</span></p>
+<figcaption>Server → client MB/s, measured 2026-10-21 on your M4 (bots on the same machine). Hover for exact values.</figcaption>
+</figure>
+<div class="table-wrap"><table>
+  <tr><th>Bots</th><th>Interest</th><th>Msgs/s out</th><th>MB/s out</th><th>Tick time (budget 100 ms)</th></tr>
+  <tr><td>300</td><td>off</td><td>3,000</td><td>21.0</td><td>32 ms</td></tr>
+  <tr><td>300</td><td>on</td><td>3,000</td><td>2.0</td><td>8 ms</td></tr>
+  <tr><td>1,000</td><td>off</td><td>9,833</td><td>226.4</td><td>74 ms</td></tr>
+  <tr><td>1,000</td><td>on</td><td>10,000</td><td>20.4</td><td>27 ms</td></tr>
+</table></div>
+<p>Read the two columns separately. <strong>Messages</strong> stay at players × 10 in both modes: that's the tick doing its job. <strong>Bytes</strong> drop about 10×: that's interest management. And at 1,000 players with interest off, one tick takes 74 of its 100 ms. A bit more load and the world starts lagging for everyone in it.</p>
+
+<h2>3. Build it</h2>
+<p>New folder: <code>~/learning-websockets/build/world</code>, reusing your <code>protocol.ts</code>. Reference: <code>labs/0009-world-interest/server.ts</code>.</p>
+<h3>Step 1: the grid</h3>
+<pre>const cellKey = (x: number, y: number) =&gt; `${Math.floor(x / RADIUS)},${Math.floor(y / RADIUS)}`;
+function nearby(p: Player): Player[] {
+  const cx = Math.floor(p.x / RADIUS), cy = Math.floor(p.y / RADIUS), out: Player[] = [];
+  for (let dx = -1; dx &lt;= 1; dx++) for (let dy = -1; dy &lt;= 1; dy++)
+    for (const o of grid.get(`${cx + dx},${cy + dy}`) ?? [])
+      if (o !== p &amp;&amp; (o.x - p.x) ** 2 + (o.y - p.y) ** 2 &lt;= RADIUS ** 2) out.push(o);
+  return out;
+}
+<span class="c">// on every move: gridRemove(p); update p.x/p.y; gridAdd(p); p.dirty = true</span></pre>
+<h3>Step 2: move = clamp, don't trust</h3>
+<pre>.on("move", z.object({ x: z.number(), y: z.number() }), ({ ws, data }) =&gt; {
+  const p = ws.data.player;
+  let dx = data.x - p.x, dy = data.y - p.y;
+  const d = Math.hypot(dx, dy);
+  if (d &gt; MAX_STEP) { dx *= MAX_STEP / d; dy *= MAX_STEP / d; }
+  gridRemove(p); p.x = Math.round(clamp(p.x + dx, 0, W)); p.y = Math.round(clamp(p.y + dy, 0, H)); gridAdd(p);
+  p.dirty = true;                            <span class="c">// sent on the next tick, not now</span>
+})</pre>
+<h3>Step 3: the tick, with per-player deltas</h3>
+<pre>setInterval(() =&gt; {
+  for (const p of players.values()) {
+    const enter = [], moves = [], ids = new Set&lt;string&gt;();
+    for (const o of nearby(p)) {
+      ids.add(o.id);
+      if (!p.seen.has(o.id)) enter.push({ id: o.id, name: o.name, x: o.x, y: o.y }); <span class="c">// new in view: full info</span>
+      else if (o.dirty) moves.push([o.id, o.x, o.y]);                               <span class="c">// known: compact tuple</span>
+    }
+    const leave = [...p.seen].filter((id) =&gt; !ids.has(id));
+    p.seen = ids;
+    const you = p.dirty ? { x: p.x, y: p.y } : undefined;   <span class="c">// the server's verdict on YOUR position</span>
+    if (enter.length || moves.length || leave.length || you)
+      p.ws.send(JSON.stringify({ type: "tick", data: { you, enter, moves, leave } }));
+  }
+  for (const p of players.values()) p.dirty = false;
+}, TICK_MS);</pre>
+<p>Notice the trade-off: every player's view is different, so you serialise <em>per player</em>, and you lose “serialise once”. That's why the grid and the radius matter so much: they keep each message small.</p>
+<h3>Step 4: proximity chat</h3>
+<p><code>chat.send</code> goes to <code>[p, ...nearby(p)]</code> and acks <code>{ heardBy }</code>. That's Gather's “only people near you can hear you”, implemented with the same function.</p>
+<h3>Step 5: the client</h3>
+<p>Copy <code>labs/0009-world-interest/public/</code>. Two techniques worth reading: <strong>client-side prediction</strong> (move your own avatar immediately, then accept the server's <code>you</code> when it differs) and <strong>interpolation</strong> (render at 60 fps by easing toward the latest 10 Hz positions).</p>
+
+<h2>4. Run and check it</h2>
+<pre>bun server.ts                                   <span class="c"># :8090</span>
+URL=http://localhost:8090 bun test ~/learning-websockets/labs/0009-world-interest/check.test.ts
+bun ~/learning-websockets/labs/0009-world-interest/bots.ts 300 10    <span class="c"># then INTEREST=off and compare</span>
+open "http://localhost:8090/?name=akarsh"       <span class="c"># walk into the bot crowd with the arrow keys</span></pre>
+
+<h2>5. Check yourself</h2>
+<section id="quiz9">
+<div class="quiz" data-explain="With cell size equal to the radius, any player within the radius must be in your cell or one of the 8 around it, so you never scan the whole world.">
+  <p class="q">Why is the grid's cell size equal to the view radius?</p>
+  <div class="opts">
+    <button class="opt">It makes each cell hold one player</button>
+    <button class="opt" data-correct>Neighbours are always in the 3×3 block</button>
+    <button class="opt">It keeps grid keys short and readable</button>
+    <button class="opt">Browsers render cells at that exact size</button>
+  </div>
+</div>
+<div class="quiz" data-explain="The tick caps messages at players × tick rate. Interest management reduces what each message contains, which is the bytes.">
+  <p class="q">With interest management on, what dropped about 10× in the measurement?</p>
+  <div class="opts">
+    <button class="opt">Messages per second sent out</button>
+    <button class="opt" data-correct>Bytes per second sent out</button>
+    <button class="opt">Number of ticks per second</button>
+    <button class="opt">Moves sent by each bot</button>
+  </div>
+</div>
+<div class="quiz" data-explain="The server clamps every move to MAX_STEP and replies with the real position in the next tick's 'you', so a cheating client only cheats itself visually.">
+  <p class="q">A hacked client sends <code>move {x: 2900, y: 2900}</code> from (100, 100). Result?</p>
+  <div class="opts">
+    <button class="opt">It teleports, since the client knows best</button>
+    <button class="opt">The server immediately disconnects it with 1008</button>
+    <button class="opt" data-correct>It moves 50 px toward that point</button>
+    <button class="opt">The move is queued for many ticks</button>
+  </div>
+</div>
+<p class="score" data-for="quiz9"></p>
+</section>
+
+<h2>6. System-design rep</h2>
+<p>60 seconds: <em>“A Gather space hosts a 2,000-person company all-hands. Everyone is in one big room. What do you do?”</em></p>
+<details class="recall"><summary>A strong answer covers…</summary>
+<ul>
+  <li>Interest management alone fails when everyone crowds into one spot: the radius contains 2,000 people. Cap visible players (nearest K), and show the rest as an aggregate count.</li>
+  <li>Lower the tick rate for far or idle avatars, and send moves only above a distance threshold.</li>
+  <li>Broadcast the speaker's stream separately (one-to-many, CDN-like) rather than through the position server.</li>
+  <li>One space = one owner process (lesson 0010). Cap players per space and build an overflow/“spectator” mode.</li>
+</ul></details>
+
+<div class="assignment">
+<h3>Assignment A9</h3>
+<p class="meta">~60 min · build/world</p>
+<ol>
+  <li>Get the 7 checks green against your server.</li>
+  <li>Add “nearest K”: if more than 50 players are in range, send only the 50 closest. Rerun the bots crowded into a 400×400 area and compare MB/s.</li>
+  <li>Add binary encoding for <code>moves</code> only (e.g. <code>Float32Array</code> of x,y with a 2-byte player index). Measure the size win before and after with <code>bots.ts</code>.</li>
+</ol>
+</div>
+
+<div class="source">
+<h3>Primary source</h3>
+<p>Gabriel Gambetta's <a href="https://www.gabrielgambetta.com/client-server-game-architecture.html">Fast-Paced Multiplayer</a> series (4 short parts): authoritative servers, client-side prediction, entity interpolation. It's the clearest explanation there is.</p>
+</div>
+
+<div class="ask"><h3>Stuck on anything?</h3><p>Ask me in the terminal. For example: “quadtree vs grid?”, “how do real MMOs handle zone borders?”, or “UDP/WebRTC for games instead of WebSockets?”</p></div>
+
+<footer class="next">
+  <a href="0008-redis-backplane.html">← Lesson 0008 · Redis backplane</a>
+  <a href="0010-space-ownership.html">Next: Lesson 0010 · Space ownership &amp; failover →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

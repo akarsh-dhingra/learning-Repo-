@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Excalidraw-Style Rooms</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="../reference/backend-patterns.html">Reference: backend patterns</a> · Lesson 5</nav>
+
+<span class="kicker">Lesson 0005 · Build · ~60 min</span>
+<h1>Build an Excalidraw-style room server</h1>
+<p class="lede">Rooms, a snapshot for whoever joins late, two kinds of messages (durable strokes and throwaway cursors), and a real canvas client you can draw on with a friend.</p>
+
+<div class="win"><strong>You'll build:</strong> a multi-room whiteboard server with presence (who's here), live cursors and shared strokes, plus a browser client. <strong>Done when:</strong> 10/10 checks pass, and two browser windows draw on the same board.</div>
+
+<h2>1. The three ideas in every collaborative room</h2>
+<ol class="steps">
+  <li><strong>Room = topic.</strong> Room id comes from the URL (<code>?room=abc</code>). Bun's <code>ws.subscribe(room)</code> plus <code>publish</code> do the fan-out. Validate the id <em>before</em> upgrading (HTTP 400), because it becomes part of keys and topics.</li>
+  <li><strong>Snapshot on join.</strong> A late joiner needs the current state, not the history of events. Send <code>room.state</code> as the very first message: <code>{ you, users, strokes }</code>.</li>
+  <li><strong>Durable vs ephemeral.</strong> Strokes are <em>durable</em>: stored in the room, acked, and late joiners see them. Cursors are <em>ephemeral</em>: never stored, never acked, and losing one is harmless because the next replaces it. Keep this split: every later lesson (resume, backpressure, scaling) treats the two kinds differently.</li>
+</ol>
+<div class="table-wrap"><table>
+  <tr><th>Message</th><th>Kind</th><th>Who gets it</th><th>Stored?</th><th>Ack?</th></tr>
+  <tr><td><code>room.state</code></td><td>snapshot</td><td>the joiner only</td><td>n/a</td><td>n/a</td></tr>
+  <tr><td><code>user.joined</code> / <code>user.left</code></td><td>presence</td><td>everyone else</td><td>in memory</td><td>no</td></tr>
+  <tr><td><code>cursor {x,y}</code> → <code>cursor {userId,x,y}</code></td><td>ephemeral</td><td>others (not sender)</td><td>no</td><td>no</td></tr>
+  <tr><td><code>stroke.add {stroke}</code> → <code>stroke.added</code></td><td>durable</td><td>others (sender already drew it)</td><td>yes</td><td>yes</td></tr>
+  <tr><td><code>scene.clear</code> → <code>scene.cleared</code></td><td>durable</td><td>everyone</td><td>yes</td><td>yes</td></tr>
+</table></div>
+
+<h2>2. Build it</h2>
+<p>Continue in <code>~/learning-websockets/build/rooms</code> and reuse your <code>protocol.ts</code> from 0004. Reference: <code>labs/0005-whiteboard-rooms/server.ts</code>.</p>
+
+<h3>Step 1: room state in memory</h3>
+<pre>type User = { id: string; name: string; color: string };
+type Room = { users: Map&lt;string, User&gt;; strokes: Stroke[] };
+const rooms = new Map&lt;string, Room&gt;();
+const getRoom = (id: string) =&gt; rooms.get(id) ?? rooms.set(id, { users: new Map(), strokes: [] }).get(id)!;
+
+<span class="c">// serialise ONCE per event, then fan out the same string to everyone</span>
+const event = (type: string, data: unknown) =&gt; JSON.stringify({ type, data });</pre>
+
+<h3>Step 2: validate at the door</h3>
+<pre>fetch(req, server) {
+  const url = new URL(req.url);
+  if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+    const room = url.searchParams.get("room") ?? "";
+    if (!/^[a-z0-9-]{1,40}$/i.test(room)) return new Response("bad room", { status: 400 });
+    const user = { id: crypto.randomUUID(), name: url.searchParams.get("name") || "anon", color: pickColor() };
+    if (server.upgrade(req, { data: { user, room } })) return;
+  }
+  return serveStatic(url);   <span class="c">// your canvas page from ./public</span>
+}</pre>
+
+<h3>Step 3: the join order matters</h3>
+<pre>open(ws) {
+  const room = getRoom(ws.data.room);
+  send(ws, "room.state", { you: ws.data.user, users: [...room.users.values()], strokes: room.strokes }); <span class="c">// 1</span>
+  ws.publish(ws.data.room, event("user.joined", { user: ws.data.user }));                       <span class="c">// 2</span>
+  room.users.set(ws.data.user.id, ws.data.user);                                                <span class="c">// 3</span>
+  ws.subscribe(ws.data.room);                                                                   <span class="c">// 4</span>
+},
+close(ws) {
+  const room = getRoom(ws.data.room);
+  room.users.delete(ws.data.user.id);
+  server.publish(ws.data.room, event("user.left", { userId: ws.data.user.id }));
+  if (room.users.size === 0) rooms.delete(ws.data.room);   <span class="c">// free memory (persist first in a real app)</span>
+}</pre>
+<p>Snapshot first, then subscribe: the joiner never sees an event before the state it applies to. On a single process this is safe because <code>open</code> is synchronous. (Lesson 0008 has to handle the multi-node case differently.)</p>
+
+<h3>Step 4: handlers</h3>
+<pre>.on("cursor", z.object({ x: z.number(), y: z.number() }), ({ ws, data }) =&gt; {
+  ws.publish(ws.data.room, event("cursor", { userId: ws.data.user.id, ...data }));   <span class="c">// no return → no ack</span>
+})
+.on("stroke.add", z.object({ stroke: Stroke }), ({ ws, data }) =&gt; {
+  const room = getRoom(ws.data.room);
+  if (room.strokes.length &gt;= 5000) throw new ClientError("limit", "room is full");   <span class="c">// bound everything</span>
+  room.strokes.push(data.stroke);
+  ws.publish(ws.data.room, event("stroke.added", { userId: ws.data.user.id, stroke: data.stroke }));
+  return { count: room.strokes.length };
+})
+.on("scene.clear", z.unknown(), ({ ws }) =&gt; {
+  getRoom(ws.data.room).strokes = [];
+  server.publish(ws.data.room, event("scene.cleared", { by: ws.data.user.id }));
+});</pre>
+<p>Use the <code>Stroke</code> schema from the lab: <code>id</code>, hex <code>color</code>, <code>width</code> 1–20, and 1–2000 <code>[x,y]</code> points. Limits on everything a client sends are your memory-safety net.</p>
+
+<h3>Step 5: the browser client</h3>
+<p>Copy <code>labs/0005-whiteboard-rooms/public/</code> into your build's <code>public/</code>. Read <code>index.html</code>: it shows the client-side patterns you'll reuse everywhere.</p>
+<ul>
+  <li><strong>Optimistic UI</strong>: draw the stroke locally right away, send <code>stroke.add</code>, and roll back if the request rejects.</li>
+  <li><strong>Client-side throttle</strong>: send cursors at most every 33 ms (~30/s), however fast the mouse moves.</li>
+  <li><strong>Logical coordinates</strong>: a fixed 1200×800 canvas space, scaled by CSS, so every screen size agrees on where (300, 200) is.</li>
+</ul>
+
+<h2>3. Check it</h2>
+<pre>bun server.ts
+URL=http://localhost:8080 bun test ~/learning-websockets/labs/0005-whiteboard-rooms/check.test.ts
+open "http://localhost:8080/?room=demo&amp;name=akarsh"     <span class="c"># and again in a second window</span></pre>
+
+<h2>4. Check yourself</h2>
+<section id="quiz5">
+<div class="quiz" data-explain="Strokes are durable: they must survive for late joiners. Cursors are ephemeral: storing them wastes memory and they're stale in milliseconds.">
+  <p class="q">A user joins a room 10 minutes late. What must <code>room.state</code> include?</p>
+  <div class="opts">
+    <button class="opt">Every cursor position since the start</button>
+    <button class="opt" data-correct>Current strokes and who is present</button>
+    <button class="opt">The last 50 raw events received</button>
+    <button class="opt">Nothing; they'll get the next events</button>
+  </div>
+</div>
+<div class="quiz" data-explain="The sender already drew its stroke optimistically. Echoing it back wastes bandwidth and risks a double draw; the ack confirms it landed.">
+  <p class="q">Why is <code>stroke.added</code> sent with <code>ws.publish</code> (excluding the sender)?</p>
+  <div class="opts">
+    <button class="opt">Bun cannot send to the sender</button>
+    <button class="opt" data-correct>Sender drew it already; ack confirms</button>
+    <button class="opt">The sender is not yet subscribed</button>
+    <button class="opt">It keeps the stroke order random</button>
+  </div>
+</div>
+<div class="quiz" data-explain="Room ids end up in topic names and (later) Redis keys. Rejecting bad input before the upgrade means no socket and no state is ever created for it.">
+  <p class="q">Where should <code>?room=../../etc</code> be rejected?</p>
+  <div class="opts">
+    <button class="opt" data-correct>In fetch, with HTTP 400 before upgrading</button>
+    <button class="opt">In open, closing the socket with 1008</button>
+    <button class="opt">In the client, before it even connects</button>
+    <button class="opt">Nowhere, since topic names are just strings</button>
+  </div>
+</div>
+<p class="score" data-for="quiz5"></p>
+</section>
+
+<h2>5. System-design rep</h2>
+<p>60 seconds: <em>“Two users drag the same rectangle at the same time. What does your server do, and what does each user see?”</em></p>
+<details class="recall"><summary>A strong answer covers…</summary>
+<ul>
+  <li>The server is the single point of order: it applies updates in the order it receives them, so last writer wins <em>per property</em> (x/y of that element). That's exactly Figma's approach.</li>
+  <li>Each client applies its own change optimistically, then converges when the server's broadcast arrives. A brief “snap” is acceptable.</li>
+  <li>For text editing inside an element you'd need more (CRDT/OT, e.g. Yjs), but shapes and positions are fine with LWW.</li>
+</ul></details>
+
+<div class="assignment">
+<h3>Assignment A5: undo for everyone</h3>
+<p class="meta">~45 min · build/rooms</p>
+<ol>
+  <li>Get the 10 checks green against your server.</li>
+  <li>Add <code>stroke.remove {id}</code>: only the stroke's author may remove it (store <code>userId</code> with each stroke, otherwise <code>forbidden</code>). Broadcast <code>stroke.removed {id}</code> to everyone and handle it in the client with <kbd>Ctrl/⌘+Z</kbd>.</li>
+  <li>Cap rooms at 20 users: the 21st gets HTTP 503 at upgrade. Why is the upgrade the right place?</li>
+</ol>
+</div>
+
+<div class="source">
+<h3>Primary source</h3>
+<p>Read Excalidraw's own write-up <a href="https://plus.excalidraw.com/blog/building-excalidraw-p2p-collaboration-feature">Building Excalidraw's P2P Collaboration Feature</a>: a relay server, rooms, and how they reconcile element versions. Then the “syncing object properties” part of <a href="https://www.figma.com/blog/how-figmas-multiplayer-technology-works/">How Figma's multiplayer technology works</a>.</p>
+</div>
+
+<div class="ask"><h3>Stuck on anything?</h3><p>Ask me in the terminal. For example: “how would I persist rooms to Postgres?”, “how does Excalidraw encrypt room data end-to-end?”, or paste a failing check.</p></div>
+
+<footer class="next">
+  <a href="0004-message-protocol.html">← Lesson 0004 · Message protocol</a>
+  <a href="0006-auth-heartbeat-resume.html">Next: Lesson 0006 · Auth, heartbeats, reconnect &amp; resume →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

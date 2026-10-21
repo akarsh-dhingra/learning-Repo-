@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bun &amp; ws Server API</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body class="ref">
+<main>
+<nav class="crumbs"><a href="../lessons/index.html">Course map</a> · Reference · taught in <a href="../lessons/0002-node-vs-bun-measured.html">Lesson 0002</a></nav>
+<span class="kicker">Reference · Bun 1.4 · ws 8</span>
+<h1>Server API: Bun vs Node + ws</h1>
+
+<div class="cols">
+<section>
+<h2>Bun: full skeleton</h2>
+<pre>type Data = { userId: string; room: string };
+
+const server = Bun.serve({
+  port: 8080,
+  fetch(req, server) {
+    const url = new URL(req.url);
+    <span class="c">// auth + Origin checks HERE, before upgrade</span>
+    const ok = server.upgrade(req, {
+      data: { userId: "u1", room: url.searchParams.get("room") ?? "lobby" },
+    });
+    if (ok) return;               <span class="c">// no Response after upgrade</span>
+    return new Response("Upgrade required", { status: 426 });
+  },
+  websocket: {
+    data: {} as Data,             <span class="c">// types ws.data</span>
+    open(ws)               { ws.subscribe(ws.data.room); },
+    message(ws, msg)       { ws.publish(ws.data.room, msg); },
+    close(ws, code, why)   { <span class="c">/* auto-unsubscribed */</span> },
+    drain(ws)              { <span class="c">/* buffer emptied: resume */</span> },
+    idleTimeout: 120,             <span class="c">// s, default 120; 0 = off</span>
+    maxPayloadLength: 16 * 1024 * 1024,   <span class="c">// default; over → 1009</span>
+    backpressureLimit: 16 * 1024 * 1024,  <span class="c">// default</span>
+    perMessageDeflate: false,
+  },
+});</pre>
+
+<h2>Bun: sending</h2>
+<table>
+<tr><th>Call</th><th>Reaches</th></tr>
+<tr><td><code>ws.send(msg)</code></td><td>this socket</td></tr>
+<tr><td><code>ws.publish(t, msg)</code></td><td>topic <code>t</code>, <strong>except</strong> sender</td></tr>
+<tr><td><code>server.publish(t, msg)</code></td><td>topic <code>t</code>, everyone</td></tr>
+<tr><td><code>ws.subscribe(t)</code> / <code>unsubscribe(t)</code></td><td>join / leave topic</td></tr>
+<tr><td><code>ws.close(code, reason)</code></td><td>closing handshake</td></tr>
+</table>
+<table>
+<tr><th><code>send()</code> returns</th><th>Meaning</th></tr>
+<tr><td><code>-1</code></td><td>queued, backpressure; wait for <code>drain</code></td></tr>
+<tr><td><code>0</code></td><td>dropped (closed or over limit)</td></tr>
+<tr><td><code>n &gt; 0</code></td><td>n bytes sent</td></tr>
+</table>
+</section>
+
+<section>
+<h2>Node + ws: same server</h2>
+<pre>import http from "node:http";
+import { WebSocketServer } from "ws";
+
+const httpServer = http.createServer((req, res) =&gt; res.end("ok"));
+const wss = new WebSocketServer({ noServer: true });
+const rooms = new Map();          <span class="c">// room → Set&lt;ws&gt; (no built-in topics)</span>
+
+httpServer.on("upgrade", (req, socket, head) =&gt; {
+  <span class="c">// auth + Origin checks HERE; on failure:</span>
+  <span class="c">// socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n"); socket.destroy();</span>
+  wss.handleUpgrade(req, socket, head, (ws) =&gt; {
+    ws.room = new URL(req.url, "http://x").searchParams.get("room") ?? "lobby";
+    if (!rooms.has(ws.room)) rooms.set(ws.room, new Set());
+    rooms.get(ws.room).add(ws);
+    ws.on("message", (data, isBinary) =&gt; {
+      for (const peer of rooms.get(ws.room))
+        if (peer !== ws) peer.send(data, { binary: isBinary });
+    });
+    ws.on("close", () =&gt; rooms.get(ws.room).delete(ws));
+  });
+});
+httpServer.listen(8080);</pre>
+<p>Heartbeats aren't automatic in <code>ws</code>. Use <code>ws.ping()</code> on an interval and terminate sockets that didn't answer with a pong (see the <a href="https://github.com/websockets/ws#how-to-detect-and-close-broken-connections">ws README</a>). Backpressure: check <code>ws.bufferedAmount</code>.</p>
+
+<h2>Client (browser, Node ≥ 22, Bun)</h2>
+<pre>const ws = new WebSocket("wss://host/?room=abc");
+ws.binaryType = "arraybuffer";
+ws.onopen    = () =&gt; ws.send(JSON.stringify({ type: "hello" }));
+ws.onmessage = (e) =&gt; console.log(e.data);
+ws.onclose   = (e) =&gt; console.log(e.code, e.reason);
+ws.readyState   <span class="c">// 0 CONNECTING 1 OPEN 2 CLOSING 3 CLOSED</span>
+ws.bufferedAmount <span class="c">// bytes queued, not yet sent</span></pre>
+
+<h2>Measured on your M4 (msgs/sec delivered)</h2>
+<table>
+<tr><th>Clients</th><th>Bun 1.4.2</th><th>Node 24 + ws</th></tr>
+<tr><td>16</td><td>1.52M</td><td>220k</td></tr>
+<tr><td>64</td><td>2.06M</td><td>225k</td></tr>
+<tr><td>256</td><td>1.89M</td><td>178k</td></tr>
+</table>
+<p>Rerun: <code>labs/0002-node-vs-bun/run-bench.sh</code></p>
+</section>
+</div>
+
+<p class="lede" style="margin-top:2rem;font-size:.9rem">Sources: <a href="https://bun.com/docs/runtime/http/websockets">Bun WebSocket docs</a> · <a href="https://github.com/websockets/ws">ws README</a> · <a href="https://nodejs.org/en/learn/getting-started/websocket">Node.js WebSocket client</a>.</p>
+</main>
+</body>
+</html>

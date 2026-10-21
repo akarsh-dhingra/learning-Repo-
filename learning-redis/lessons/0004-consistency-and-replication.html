@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Consistency and Replication</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="0003-data-structures-toolkit.html">← 0003</a></nav>
+
+<span class="kicker">Lesson 0004 · Video ≈31:00 → ≈34:00 · 20 min</span>
+<h1>Stale reads, replicas, and failover</h1>
+<p class="lede">Two short video sections that interviewers dig into: “is the cache consistent?” and “what happens when the Redis box dies?”</p>
+
+<div class="win"><strong>Your win:</strong> you run a primary and a replica on your laptop, see a replica refuse a write, and can explain why a replica is <em>not</em> a backup of the last second of writes.</div>
+
+<h2>1. Caches are eventually consistent</h2>
+<p>The video's Instagram example: a post's like count is cached with a 10-minute TTL. New likes go to the database, but readers see the cached number until the key expires. The data catches up <em>eventually</em> rather than immediately.</p>
+<p>You have two levers:</p>
+<ul>
+  <li><strong>Shorter TTL</strong>: less staleness, more DB load.</li>
+  <li><strong>Invalidate on write</strong>: after updating the DB, <code>DEL</code> the cache key so the next read refills it. You'll build this in Lesson 0006. Delete rather than overwrite with the new value: if two writers race, overwriting can leave the <em>older</em> value in the cache, while deleting just forces a fresh read.</li>
+</ul>
+
+<h2>2. Three ways to deploy</h2>
+<div class="table-wrap"><table>
+  <tr><th>Setup</th><th>Writes</th><th>Reads</th><th>If a node dies</th></tr>
+  <tr><td><strong>Single node</strong></td><td>1 node</td><td>1 node</td><td>Down until it's back</td></tr>
+  <tr><td><strong>Primary + replicas</strong></td><td>Primary only</td><td>Primary or replicas</td><td>A replica can be promoted, <em>if something promotes it</em></td></tr>
+  <tr><td><strong>Cluster</strong> (Lesson 0005)</td><td>Split across many primaries</td><td>Primaries (+ replicas)</td><td>A replica of that shard takes over automatically</td></tr>
+</table></div>
+
+<h3>How replication really works</h3>
+<ul>
+  <li>Replication is <strong>asynchronous</strong> by default. The primary replies “OK” to your client <em>before</em> the replicas have the write<sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/management/replication/">[1]</a></sup>.</li>
+  <li>Replicas are <strong>read-only</strong> by default and reject writes<sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/management/replication/">[1]</a></sup>.</li>
+  <li><code>WAIT n timeout</code> blocks until <em>n</em> replicas confirm the write. It makes data loss much less likely, but the docs say it does <strong>not</strong> make Redis strongly consistent: acknowledged writes can still be lost during a failover<sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/management/replication/">[1]</a></sup>.</li>
+  <li>Plain replication <strong>doesn't promote replicas by itself</strong>. Automatic failover comes from <em>Redis Sentinel</em> or <em>Redis Cluster</em><sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/management/replication/">[1]</a></sup>.</li>
+</ul>
+
+<div class="correction">
+  <div><span class="label">The video says</span>If the main node fails, “we will serve the data from the replica”, and replicas hold the same data as the main.</div>
+  <div><span class="label">The docs add</span>A replica holds <em>almost</em> the same data: anything the primary acknowledged but hadn't sent yet is lost on failover. And something (Sentinel or Cluster) has to do the promoting. Also: a primary with persistence <em>off</em> that auto-restarts comes back empty, and its replicas then copy the empty dataset and wipe their own data<sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/management/replication/">[1]</a></sup>.</div>
+</div>
+
+<h2>3. Hands-on: a primary and a replica (6 min)</h2>
+<pre><span class="c"># put the existing redis-stack container on a network with a new replica</span>
+docker network create redis-net
+docker network connect redis-net redis-stack
+docker run -d --name redis-replica --network redis-net -p 6380:6379 \
+  -e REDIS_ARGS="--replicaof redis-stack 6379" redis/redis-stack-server:latest
+
+docker exec redis-stack   redis-cli SET greeting hello
+docker exec redis-replica redis-cli GET greeting          <span class="c"># "hello"</span>
+docker exec redis-replica redis-cli SET greeting bye      <span class="c"># READONLY error</span>
+docker exec redis-replica redis-cli INFO replication | grep -E "^role|link_status"
+docker exec redis-stack   redis-cli WAIT 1 1000           <span class="c"># 1 replica acknowledged</span></pre>
+<p>I tested these exact commands. Use the <code>redis-stack-server</code> image for the replica: the plain <code>redis</code> image crashes because it can't load Redis Stack's module data.</p>
+<p>Now simulate a lag: <code>docker pause redis-replica</code>, write a new value on the primary, read the replica (it hangs while paused), then <code>docker unpause redis-replica</code> and watch it catch up. Clean up with <code>docker rm -f redis-replica</code>.</p>
+
+<h2>4. Check yourself</h2>
+<section id="q4">
+<div class="quiz" data-explain="Replication is asynchronous. The primary acknowledged the write, crashed before sending it, and the promoted replica never had it.">
+  <p class="q">The primary says OK to <code>SET order:9 paid</code> and crashes a millisecond later. A replica is promoted. <code>GET order:9</code> on it returns…</p>
+  <div class="opts"><button class="opt" data-correct>Possibly nil; the write was lost</button><button class="opt">Always paid; replicas stay in sync</button><button class="opt">An error until the primary returns</button><button class="opt">Paid, since WAIT is always implicit</button></div>
+</div>
+<div class="quiz" data-explain="Replicas are read-only by default and reject writes with a READONLY error. Writes always go to the primary.">
+  <p class="q">Your app accidentally sends a <code>SET</code> to a replica. What happens?</p>
+  <div class="opts"><button class="opt">The replica forwards it upstream</button><button class="opt" data-correct>It's rejected with READONLY error</button><button class="opt">It's kept only on replica</button><button class="opt">It's queued until a failover</button></div>
+</div>
+<div class="quiz" data-explain="Deleting forces the next read to fetch fresh data from the DB. Writing the new value into the cache can race with another writer and leave an older value behind.">
+  <p class="q">After updating a product's price in Postgres, the safest cache action is…</p>
+  <div class="opts"><button class="opt" data-correct>DEL the key, refill on read</button><button class="opt">SET the new value right away</button><button class="opt">Wait for the TTL to expire</button><button class="opt">FLUSHALL everything to be completely sure</button></div>
+</div>
+<div class="quiz" data-explain="Plain replication only copies data. Sentinel (or Redis Cluster) watches the primary and promotes a replica.">
+  <p class="q">Who promotes a replica when a plain primary+replica setup loses its primary?</p>
+  <div class="opts"><button class="opt">The replica, automatically</button><button class="opt">The client library</button><button class="opt" data-correct>Sentinel, or Cluster</button><button class="opt">The primary, restarting</button></div>
+</div>
+<p class="score" data-for="q4"></p>
+</section>
+
+<div class="assignment">
+<h3>Assignment 0004: read-your-writes</h3>
+<p class="meta">≈8 min · think, then answer in the terminal</p>
+<p>You send reads to replicas to take load off the primary. A user changes their display name (write → primary), and the page immediately reloads it (read → replica). Sometimes they see their <em>old</em> name.</p>
+<ol class="steps">
+  <li>Explain exactly why, in terms of asynchronous replication.</li>
+  <li>Propose two fixes. One that routes reads, and one that uses a command from this lesson. Give one downside of each.</li>
+  <li>Would you put a <strong>rate-limit counter</strong> or a <strong>lock</strong> on a replica read path? Why not?</li>
+</ol>
+</div>
+
+<div class="source"><h3>Primary source</h3><p><a href="https://redis.io/docs/latest/operate/oss_and_stack/management/replication/">Redis replication</a>. Read the intro, “Important facts”, and “Safety of replication when master has persistence turned off” (about 8 min).</p></div>
+<div class="ask"><h3>Questions?</h3><p>Ask me “what does Sentinel actually do?” or “how does AWS ElastiCache handle failover?”.</p></div>
+
+<footer class="next">
+  <a href="0003-data-structures-toolkit.html">← 0003</a>
+  <a href="0005-redis-cluster.html">0005 · Redis Cluster →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

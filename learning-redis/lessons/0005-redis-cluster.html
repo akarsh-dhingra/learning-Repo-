@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis Cluster</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="0004-consistency-and-replication.html">← 0004</a> · <a href="../reference/cluster.html">Reference: cluster</a></nav>
+
+<span class="kicker">Lesson 0005 · Video ≈34:00 → ≈42:00 · 25 min</span>
+<h1>Redis Cluster: slots, redirects, failover</h1>
+<p class="lede">The most interview-heavy section of the video. One formula decides where every key lives, and almost everything else follows from it.</p>
+
+<div class="win"><strong>Your win:</strong> you compute which node owns a key, design keys so related data stays together, and watch a real 6-node cluster send <code>MOVED</code> and survive a dead primary.</div>
+
+<h2>1. Why shard at all</h2>
+<p>Replicas (Lesson 0004) scale <em>reads</em>, but every write still goes to one primary, and the whole dataset must fit in that primary's RAM. Sharding spreads keys across several primaries, so writes and memory scale out. Each primary can still have its own replicas.</p>
+
+<h2>2. The one formula</h2>
+<p>The keyspace is split into exactly <strong>16 384 hash slots</strong>. Every key maps to one slot<sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">[1]</a></sup>:</p>
+<pre>HASH_SLOT = CRC16(key) mod 16384</pre>
+<p>Each primary owns ranges of slots. The video's image of slots as buckets is right: <em>nodes</em> hold slots and <em>slots</em> hold keys. With 3 primaries the default split is A: 0–5460, B: 5461–10922, C: 10923–16383. That's exactly what my test cluster printed.</p>
+<p><strong>Try it.</strong> Edit the keys below (the result updates as you type):</p>
+<div class="slotcalc" data-keys="user:42,{user:42}.cart,{user:42}.profile,foo,bar"></div>
+<p><small>This runs the spec's CRC16 in your browser. I checked it against the spec's test value (<code>0x31C3</code>) and against <code>CLUSTER KEYSLOT</code> on a real cluster (<code>foo</code> → 12182).</small></p>
+
+<h3>Hash tags: keeping keys together on purpose</h3>
+<p>If a key contains <code>{…}</code> with something inside, <em>only that part</em> is hashed. So <code>{user:42}.cart</code> and <code>{user:42}.profile</code> land in the same slot<sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">[1]</a></sup>. This matters because multi-key commands (<code>MSET</code>, transactions, Lua scripts touching two keys) only work if every key is in one slot. Otherwise you get a <code>CROSSSLOT</code> error. The A1 lock uses <code>lock:{seat:A1}</code> and <code>fence:{seat:A1}</code> for exactly this reason.</p>
+
+<h2>3. How a request finds its node</h2>
+<ol class="steps">
+  <li>On connect, the client fetches the slot → node map (<code>CLUSTER SHARDS</code>) and caches it.</li>
+  <li>For each command it hashes the key, looks up the node, and connects to it <strong>directly</strong>, with no proxy in between.</li>
+  <li>If the node doesn't own that slot, it replies <code>-MOVED 3999 127.0.0.1:6381</code>. The client retries there and should refresh its map, since several slots have probably moved<sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">[1]</a></sup>.</li>
+  <li>While a slot is being migrated, a node may reply <code>-ASK</code> instead. That means: try the other node for <em>this one query</em> (prefixed with <code>ASKING</code>), but <em>don't</em> update your map yet<sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">[1]</a></sup>.</li>
+</ol>
+
+<div class="correction">
+  <div><span class="label">The video says</span>If a request reaches the wrong node, nodes use gossip to “redirect it to the correct node”, and the slot count is “approximately” 16384.</div>
+  <div><span class="label">The spec says</span>Nodes don't forward your request. They <em>reply</em> with <code>MOVED</code> and the <strong>client</strong> resends it. Gossip (over the cluster bus, port + 10000) is how nodes learn about each other's health and slot ownership, not how requests get routed. The count is exactly 16384<sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">[1]</a></sup>.</div>
+</div>
+
+<h2>4. Failure and failover</h2>
+<ul>
+  <li>A node that doesn't answer a ping for longer than <code>NODE_TIMEOUT</code> is marked <code>PFAIL</code> (possibly failed). Once a majority of primaries agree, it becomes <code>FAIL</code><sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">[1]</a></sup>.</li>
+  <li>That primary's replicas then call an election, the other primaries vote, and the winner takes over its slots. The spec says failovers usually take 1–2 seconds after detection<sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">[1]</a></sup>.</li>
+  <li>Replication is still asynchronous, so a write acknowledged just before the crash can be lost. During a network split, the side with fewer primaries stops accepting writes once <code>NODE_TIMEOUT</code> has passed<sup class="cite"><a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">[1]</a></sup>.</li>
+</ul>
+
+<h2>5. Hands-on: a real cluster (8 min)</h2>
+<pre>sh ~/learning-redis/labs/0005-cluster/start-cluster.sh
+docker exec -it redis-cluster redis-cli -p 7000       <span class="c"># WITHOUT -c first</span>
+127.0.0.1:7000> SET foo bar          <span class="c"># → MOVED 12182 127.0.0.1:7002</span>
+127.0.0.1:7000> CLUSTER KEYSLOT foo  <span class="c"># 12182: matches the calculator</span>
+127.0.0.1:7000> exit
+docker exec -it redis-cluster redis-cli -c -p 7000    <span class="c"># -c follows redirects</span>
+127.0.0.1:7000> SET foo bar          <span class="c"># redirected to 7002, OK</span>
+127.0.0.1:7002> MSET a 1 b 2         <span class="c"># CROSSSLOT error</span>
+127.0.0.1:7002> MSET {u:1}.a 1 {u:1}.b 2   <span class="c"># OK: same slot</span>
+127.0.0.1:7002> CLUSTER NODES</pre>
+<p><strong>Kill a primary and watch the failover:</strong></p>
+<pre>docker exec redis-cluster redis-cli -p 7002 SHUTDOWN NOSAVE
+sleep 8
+docker exec redis-cluster redis-cli -p 7000 CLUSTER NODES   <span class="c"># 7002 master,fail; a replica is now master</span>
+docker exec redis-cluster redis-cli -c -p 7000 GET foo      <span class="c"># still "bar"</span>
+docker rm -f redis-cluster                                  <span class="c"># when done</span></pre>
+<p>When I ran this, replica 7005 took over slots 10923–16383 and <code>GET foo</code> still returned <code>bar</code>.</p>
+
+<h2>6. Check yourself</h2>
+<section id="q5">
+<div class="quiz" data-explain="Only the text inside the first non-empty {…} is hashed, so both keys hash 'user:42' and share a slot.">
+  <p class="q">Do <code>{user:42}.cart</code> and <code>{user:42}.orders</code> always share a slot?</p>
+  <div class="opts"><button class="opt" data-correct>Yes, only user:42 is hashed</button><button class="opt">No, full key is hashed</button><button class="opt">Only if both have TTLs</button><button class="opt">Only on the same primary</button></div>
+</div>
+<div class="quiz" data-explain="MOVED means the slot now lives elsewhere for good, so update the map. ASK is a one-off during migration, so don't update it.">
+  <p class="q">A client gets <code>-ASK 8 10.0.0.2:6379</code>. It should…</p>
+  <div class="opts"><button class="opt">Update its slot map for good</button><button class="opt" data-correct>Retry once there, keep its map</button><button class="opt">Retry the same node again later</button><button class="opt">Fail the command with a CROSSSLOT</button></div>
+</div>
+<div class="quiz" data-explain="The keys hash to different slots, which may live on different nodes, so Redis refuses with CROSSSLOT. Use hash tags to group them.">
+  <p class="q"><code>MSET user:1:name A user:2:name B</code> fails on a cluster. Why?</p>
+  <div class="opts"><button class="opt" data-correct>Keys hash to different slots</button><button class="opt">MSET is disabled on clusters</button><button class="opt">Replicas can't ever accept MSET</button><button class="opt">Colons aren't allowed in keys</button></div>
+</div>
+<div class="quiz" data-explain="Every request for that key hashes to the same slot, which is owned by one primary. Adding nodes spreads other keys, not this one. That's Lesson 0007.">
+  <p class="q">One key gets 80% of traffic. Does adding 10 more primaries help that key?</p>
+  <div class="opts"><button class="opt">Yes, load spreads out automatically</button><button class="opt" data-correct>No, one key, one slot</button><button class="opt">Yes, after a manual reshard</button><button class="opt">No, clusters forbid hot keys</button></div>
+</div>
+<p class="score" data-for="q5"></p>
+</section>
+
+<div class="assignment">
+<h3>Assignment 0005: design the keys</h3>
+<p class="meta">≈10 min · use the calculator above and the lab cluster</p>
+<ol class="steps">
+  <li>A checkout runs one Lua script that reads <code>cart</code>, decrements <code>stock</code> for the product, and appends to the user's <code>orders</code>. Propose key names. Can you get <em>all three</em> into one slot without putting every user's cart on a single node? If not, how would you restructure the operation?</li>
+  <li>A teammate proposes the hash tag <code>{global}</code> on every key “so transactions always work”. Run three such keys through the calculator. What's the catch?</li>
+  <li>On the lab cluster, write 10 keys <code>user:1</code>…<code>user:10</code>, then count how many ended up on each primary (<code>CLUSTER COUNTKEYSINSLOT</code> or <code>DBSIZE</code> per port). Is it even?</li>
+</ol>
+<p>Send me your answers and I'll review them.</p>
+</div>
+
+<div class="source"><h3>Primary source</h3><p><a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">Redis Cluster specification</a>. Read “Key distribution model”, “Hash tags”, “MOVED Redirection” and “ASK redirection” (about 15 min). Skim the rest.</p></div>
+<div class="ask"><h3>Questions?</h3><p>Ask me “why 16384 and not 65536?” or “how do I connect node-redis to a cluster?”.</p></div>
+
+<footer class="next">
+  <a href="0004-consistency-and-replication.html">← 0004</a>
+  <a href="0006-caching-postgres-for-real.html">0006 · Caching Postgres for real →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/hashslot.js"></script>
+</body>
+</html>

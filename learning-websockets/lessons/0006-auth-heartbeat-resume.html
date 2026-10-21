@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auth, Heartbeats &amp; Resume</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="../reference/backend-patterns.html">Reference: backend patterns</a> · Lesson 6</nav>
+
+<span class="kicker">Lesson 0006 · Build · ~75 min</span>
+<h1>Auth, heartbeats, reconnect &amp; resume</h1>
+<p class="lede">Real connections drop: subway tunnels, laptop lids, deploys. A production socket layer is mostly about what happens <em>around</em> the messages.</p>
+
+<div class="win"><strong>You'll build:</strong> token auth and Origin checks at upgrade, token expiry, presence that survives multiple tabs, per-room sequence numbers with a replay log, and a client that reconnects with jittered backoff and <em>resumes</em> without losing a stroke. <strong>Done when:</strong> 10/10 checks pass, and the “Drop connection” button reconnects cleanly.</div>
+
+<h2>1. The connection lifecycle</h2>
+<figure>
+<svg viewBox="0 0 640 140" role="img" aria-label="Lifecycle: connect with token and lastSeq, server verifies, sends state or resume, live events with seq, connection drops, client waits a jittered backoff, reconnects with lastSeq.">
+  <rect class="box" x="5" y="20" width="110" height="44" rx="6"/><text x="60" y="40" text-anchor="middle" font-size="11">connect</text><text class="small" x="60" y="55" text-anchor="middle">token, lastSeq</text>
+  <rect class="hot" x="135" y="20" width="110" height="44" rx="6"/><text x="190" y="40" text-anchor="middle" font-size="11">verify</text><text class="small" x="190" y="55" text-anchor="middle">401 / 403</text>
+  <rect class="box" x="265" y="20" width="110" height="44" rx="6"/><text x="320" y="40" text-anchor="middle" font-size="11">state | resume</text><text class="small" x="320" y="55" text-anchor="middle">snapshot or gap</text>
+  <rect class="box" x="395" y="20" width="110" height="44" rx="6"/><text x="450" y="40" text-anchor="middle" font-size="11">live events</text><text class="small" x="450" y="55" text-anchor="middle">seq 41, 42, 43…</text>
+  <rect class="hot" x="525" y="20" width="110" height="44" rx="6"/><text x="580" y="40" text-anchor="middle" font-size="11">drop</text><text class="small" x="580" y="55" text-anchor="middle">1006 / 1001 / 4001</text>
+  <path class="line" d="M115 42 H135 M245 42 H265 M375 42 H395 M505 42 H525"/>
+  <path class="line miss" d="M580 64 V110 H60 V64"/>
+  <text class="small" x="320" y="128" text-anchor="middle">backoff = random(0, min(10s, 0.5s × 2^attempt)) → reconnect with lastSeq = 43</text>
+</svg>
+</figure>
+
+<h2>2. Auth at the door</h2>
+<ul>
+  <li><strong>Browsers can't set headers</strong> on <code>new WebSocket()</code>. Your options are a cookie (sent automatically on the upgrade) or a token in the query string. We use a short-lived signed token: <code>base64url(payload).base64url(HMAC-SHA256(secret, payloadPart))</code> with <code>{ sub, name, exp }</code>. It's the same idea as a JWT. Your main API issues it, and the socket server only <em>verifies</em> it.</li>
+  <li><strong>Check <code>Origin</code></strong>. Browsers always send it on the upgrade. Without an allowlist, any website can open a socket to you <em>with your user's cookies</em> (cross-site WebSocket hijacking). Non-browser clients send no Origin, so you let them through and rely on the token.</li>
+  <li><strong>Identity comes from the token</strong>, never from <code>?name=</code>.</li>
+  <li><strong>Tokens expire mid-connection.</strong> Set a timer for <code>exp</code>, close with your own code <code>4001</code>, and have the client fetch a new token and reconnect at once.</li>
+</ul>
+<pre>if (origin &amp;&amp; !ALLOWED_ORIGINS.includes(origin)) return new Response("bad origin", { status: 403 });
+const auth = verifyToken(url.searchParams.get("token"));      <span class="c">// null if bad signature or expired</span>
+if (!auth) return new Response("invalid or expired token", { status: 401 });
+<span class="c">// … in open():</span>
+ws.data.expiry = setTimeout(() =&gt; ws.close(4001, "token expired"), auth.exp * 1000 - Date.now());
+<span class="c">// … in close(): clearTimeout(ws.data.expiry)</span></pre>
+<p>Copy <code>labs/0006-auth-heartbeat-resume/auth.ts</code> (30 lines: <code>signToken</code>, <code>verifyToken</code> with a constant-time compare). The checks sign their own tokens with the default secret, so keep the format.</p>
+
+<h2>3. Heartbeats: finding dead connections</h2>
+<p>A phone that loses signal sends nothing. No close frame, no FIN. Without heartbeats, the server keeps that socket (and its user in the presence list) for minutes.</p>
+<ul>
+  <li><strong>Server side:</strong> Bun pings automatically and closes a socket after <code>idleTimeout</code> seconds of silence<sup class="cite"><a href="https://bun.com/docs/runtime/http/websockets">[1]</a></sup>. Set <code>idleTimeout: 30</code>. With <code>ws</code> on Node you write the ping/terminate loop yourself.</li>
+  <li><strong>Client side:</strong> browser JS never sees protocol pings, so the <em>client</em> can't tell a dead link from a quiet room. Send an app-level <code>ping</code> request every 10 s. If there's no ack within 5 s, close and reconnect.</li>
+</ul>
+
+<h2>4. Presence per user, not per socket</h2>
+<p>Alice opens two tabs, then closes one. She must not “leave”. Keep <code>Map&lt;userId, { user, conns }&gt;</code>: announce <code>user.joined</code> on 0→1 and <code>user.left</code> on 1→0.</p>
+
+<h2>5. Sequence numbers and resume</h2>
+<p>This is the core of reliable delivery over an unreliable socket. Every <strong>durable</strong> event in a room gets the next number, and the room remembers the last 200:</p>
+<pre>function durable(roomId: string, type: string, data: unknown) {
+  const room = getRoom(roomId);
+  const msg = JSON.stringify({ type, seq: ++room.seq, data });
+  room.log.push({ seq: room.seq, msg });
+  if (room.log.length &gt; 200) room.log.shift();
+  return msg;
+}</pre>
+<p>The client remembers the last <code>seq</code> it applied, and reconnects with <code>?lastSeq=41&amp;epoch=…</code>. In <code>open</code>:</p>
+<pre>const oldest = room.log[0]?.seq ?? room.seq + 1;
+const canResume = lastSeq !== null &amp;&amp; epoch === room.epoch &amp;&amp; lastSeq &lt;= room.seq &amp;&amp; lastSeq &gt;= oldest - 1;
+if (canResume) send(ws, "room.resume", { you, users, events: logAfter(lastSeq), seq: room.seq, epoch: room.epoch });
+else           send(ws, "room.state",  { you, users, strokes: room.strokes, seq: room.seq, epoch: room.epoch });</pre>
+<ul>
+  <li><strong>Epoch</strong>: a random id per room <em>incarnation</em>. If the server restarted and the room was rebuilt, seq 41 means something else now. A wrong epoch means a full snapshot.</li>
+  <li><strong>Too old</strong> (the gap is bigger than the log): full snapshot. Resume is an optimisation, and the snapshot is always the safe fallback.</li>
+  <li><strong>Keep empty rooms ~60 s</strong> so a quick reconnect can still resume.</li>
+  <li>Cursors and presence get <em>no</em> seq. Nobody needs to replay a cursor.</li>
+</ul>
+
+<h2>6. The reconnecting client</h2>
+<p>Read <code>labs/0006-auth-heartbeat-resume/public/client.js</code>. Then write your own and compare. The essentials:</p>
+<pre>export const backoff = (attempt) =&gt; Math.random() * Math.min(10_000, 500 * 2 ** attempt); <span class="c">// "full jitter"</span>
+
+ws.onclose = async (e) =&gt; {
+  rejectAllPending();                              <span class="c">// in-flight requests fail fast</span>
+  if (stoppedByUser) return;
+  if (e.code === 4001) { await refreshToken(); return connect(); }
+  setTimeout(connect, backoff(attempt++));         <span class="c">// attempt resets to 0 on a successful open</span>
+};
+<span class="c">// on any event with seq: if (seq &lt;= lastSeq) drop it (duplicate), else apply and lastSeq = seq</span></pre>
+<p>Why <em>jitter</em>: when a node restarts, 50,000 clients disconnect in the same second. Without randomness they all retry at 0.5 s, then 1 s, then 2 s, in synchronized waves that knock the next node over. Full jitter spreads them evenly<sup class="cite"><a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">[2]</a></sup>.</p>
+
+<h2>7. Check it</h2>
+<pre>bun server.ts
+URL=http://localhost:8080 bun test ~/learning-websockets/labs/0006-auth-heartbeat-resume/check.test.ts
+open "http://localhost:8080/?room=demo&amp;name=akarsh"   <span class="c"># click "Drop connection" and watch the status line</span></pre>
+<p>Try the real failure too: draw in window A, stop the server with Ctrl-C, start it again. Window A reconnects, but the epoch changed, so it gets a fresh (empty) <code>room.state</code>. That's correct behaviour for in-memory rooms, and the motivation for lesson 0008's Redis-backed state.</p>
+
+<h2>8. Check yourself</h2>
+<section id="quiz6">
+<div class="quiz" data-explain="Without an Origin allowlist, any website the user visits can open a socket to your server, and the browser attaches your site's cookies automatically.">
+  <p class="q">Why check the <code>Origin</code> header if you already verify a token?</p>
+  <div class="opts">
+    <button class="opt">Tokens cannot be sent over WebSockets ever</button>
+    <button class="opt" data-correct>Cookie-authed sockets from hostile sites otherwise succeed</button>
+    <button class="opt">Origin tells you which room to join</button>
+    <button class="opt">Proxies drop sockets that lack Origin headers</button>
+  </div>
+</div>
+<div class="quiz" data-explain="The log only holds the last 200 events. If the client missed more, replaying is impossible, so it gets the full current state instead.">
+  <p class="q">A client reconnects with <code>lastSeq=10</code>, but the room is at seq 900 and keeps 200 events. Send…</p>
+  <div class="opts">
+    <button class="opt">room.resume with events 700 to 900</button>
+    <button class="opt">room.resume with events 11 to 900</button>
+    <button class="opt" data-correct>room.state, the full current snapshot</button>
+    <button class="opt">error invalid, then close the socket</button>
+  </div>
+</div>
+<div class="quiz" data-explain="Browsers handle protocol ping/pong internally and never expose them to JavaScript, so the page can't use them to detect a dead connection.">
+  <p class="q">Why does the browser client send its own <code>ping</code> request?</p>
+  <div class="opts">
+    <button class="opt">Bun ignores all protocol-level ping frames</button>
+    <button class="opt" data-correct>JavaScript cannot see protocol ping frames</button>
+    <button class="opt">It stops the token from expiring</button>
+    <button class="opt">The WebSocket spec requires it always</button>
+  </div>
+</div>
+<p class="score" data-for="quiz6"></p>
+</section>
+
+<h2>9. System-design rep</h2>
+<p>60 seconds: <em>“You deploy a new version of your gateway. 40,000 users are connected to the old pods. Walk me through what happens to them, and how you keep it boring.”</em></p>
+<details class="recall"><summary>A strong answer covers…</summary>
+<ul>
+  <li>Old pods drain: fail health checks, stop taking new sockets, close existing ones with 1001 spread over a window (lesson 0012).</li>
+  <li>Clients reconnect with jittered backoff and land on new pods via the load balancer.</li>
+  <li>They resume with lastSeq + epoch. Room state lives outside the pod (Redis, lesson 0008), so the epoch survives the deploy and resume works, so nobody loses work.</li>
+  <li>Tokens are short-lived and refreshed on 4001. Watch connection-count and reconnect-rate dashboards during the rollout.</li>
+</ul></details>
+
+<div class="assignment">
+<h3>Assignment A6: harden it</h3>
+<p class="meta">~45 min · build/rooms</p>
+<ol>
+  <li>Get the 10 checks green against your server.</li>
+  <li>Add a unit test for your <code>backoff()</code>: it never exceeds 10 s, and over 1,000 calls for attempt 5 the values are spread out (min &lt; 1 s, max &gt; 9 s).</li>
+  <li>Make the client show a banner “Reconnecting (attempt 3)…” after 2 s offline, and replay any strokes the user drew while offline once it's back. Hint: queue <code>stroke.add</code> requests while closed.</li>
+</ol>
+</div>
+
+<div class="source">
+<h3>Primary source</h3>
+<p>AWS Architecture Blog: <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">Exponential Backoff and Jitter</a> (10 min, with the simulation that justifies full jitter). For Origin checks: <a href="https://cheatsheetseries.owasp.org/cheatsheets/WebSocket_Security_Cheat_Sheet.html">OWASP WebSocket Security Cheat Sheet</a>.</p>
+</div>
+
+<div class="ask"><h3>Stuck on anything?</h3><p>Ask me in the terminal. For example: “cookie vs query-string token: which leaks less?”, “how would I use real JWTs from my Express app here?”, or paste a failing check.</p></div>
+
+<footer class="next">
+  <a href="0005-whiteboard-rooms.html">← Lesson 0005 · Rooms</a>
+  <a href="0007-backpressure.html">Next: Lesson 0007 · Backpressure &amp; slow consumers →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

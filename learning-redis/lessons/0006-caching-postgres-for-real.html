@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caching Postgres for Real</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="0005-redis-cluster.html">← 0005</a></nav>
+
+<span class="kicker">Lesson 0006 · Video ≈42:00 → ≈51:00 · 25 min</span>
+<h1>Caching Postgres for real, and measuring honestly</h1>
+<p class="lede">The video's second demo: a million products in Postgres with Redis in front. You'll add the part it leaves out, the write path, and see what the numbers actually show.</p>
+
+<div class="win"><strong>Your win:</strong> a Node API over 1M Postgres rows with cache-aside reads, invalidation on writes, an eviction policy, and p50/p95 numbers you measured yourself.</div>
+
+<h2>1. Recap in one diagram's worth of words</h2>
+<p>Same cache-aside flow as Lesson 0001, now with a real database. Keys look like <code>product:42</code> with a 600-second TTL. The video calls out three more things worth knowing:</p>
+<ul>
+  <li><strong>Cluster</strong> lets the cache scale horizontally: add primaries for more memory and throughput (Lesson 0005).</li>
+  <li><strong>TTL</strong> means stale or unused entries clean themselves up.</li>
+  <li>Caching doesn't fix <strong>hot keys</strong>, where one key gets most of the traffic. That's Lesson 0007.</li>
+</ul>
+
+<h2>2. Run it (8 min)</h2>
+<p>The lab is ready at <code>~/learning-redis/labs/0006-postgres-cache/</code> (dependencies installed). Postgres runs in the <code>postgres-db</code> container, which I already started and seeded with 1,000,000 rows in about 3 seconds using <code>generate_series</code> rather than the video's 10k-row batches.</p>
+<pre><span class="c"># if postgres-db isn't running:</span>
+docker start postgres-db || docker run -d --name postgres-db -e POSTGRES_USER=user \
+  -e POSTGRES_PASSWORD=pass -e POSTGRES_DB=mydb -p 5432:5432 postgres:17
+
+cd ~/learning-redis/labs/0006-postgres-cache
+npm run seed          <span class="c"># idempotent: says "Already seeded" the second time</span>
+npm start             <span class="c"># terminal 1</span>
+npm run bench         <span class="c"># terminal 2: 200 random ids, cold then warm</span></pre>
+
+<h2>3. What the numbers really say</h2>
+<p>Here's what I got on your machine:</p>
+<pre>cold  p50=0.53ms  p95=1.41ms  p99=2.41ms  sources={"db":200}
+warm  p50=0.14ms  p95=0.18ms  p99=0.28ms  sources={"cache":200}</pre>
+<p>The cache is about <strong>4× faster</strong>, and its tail latency is far tighter. But a primary-key lookup on a local Postgres already takes only half a millisecond. The video's 117 ms vs 25 ms was mostly first-request costs (new connections, cold buffers), not the steady-state gap.</p>
+<div class="win"><strong>The interview-grade takeaway:</strong> caching pays most when the source is <em>expensive</em> (joins, aggregations, a remote or overloaded DB, a third-party API) or when <em>load</em> on the DB is the problem, not when a single indexed lookup is slow. Always measure p95/p99, not just one request.</div>
+
+<h2>4. The write path: invalidate</h2>
+<p>The lab adds <code>PUT /products/:id/price</code>. It updates Postgres <em>first</em>, then runs <code>DEL product:&lt;id&gt;</code>. The next GET misses and refills with the new price:</p>
+<pre>curl -s localhost:3000/products/42                      <span class="c"># source: db, price 48.05</span>
+curl -s localhost:3000/products/42                      <span class="c"># source: cache</span>
+curl -s -X PUT -H 'content-type: application/json' \
+  -d '{"price":9.99}' localhost:3000/products/42/price   <span class="c"># invalidated: product:42</span>
+curl -s localhost:3000/products/42                      <span class="c"># source: db, price 9.99</span></pre>
+<details class="recall"><summary>Why update the DB first and delete the cache second, rather than the other way round?</summary>
+If you delete first, another request can miss, read the <em>old</em> row (your UPDATE hasn't committed yet), and put the stale value back into the cache. It then stays stale for the full TTL. Updating first shrinks that window a lot, though it doesn't eliminate it, which is why you still keep a TTL as a safety net.</details>
+
+<h2>5. When memory runs out: eviction</h2>
+<p>By default <code>maxmemory</code> is 0 (no limit on 64-bit). When you set a limit, the <code>maxmemory-policy</code> decides what gets dropped<sup class="cite"><a href="https://redis.io/docs/latest/develop/reference/eviction/">[1]</a></sup>:</p>
+<div class="table-wrap"><table>
+  <tr><th>Policy</th><th>Evicts</th><th>Use when</th></tr>
+  <tr><td><code>noeviction</code></td><td>Nothing: writes error out</td><td>Redis holds data you can't lose</td></tr>
+  <tr><td><code>allkeys-lru</code></td><td>Least recently used, any key</td><td>Good default for a cache (a small set of keys gets most reads)</td></tr>
+  <tr><td><code>allkeys-lfu</code></td><td>Least frequently used</td><td>Popularity is steady over time</td></tr>
+  <tr><td><code>volatile-*</code></td><td>Only keys with a TTL</td><td>Cache and persistent data share one instance (the docs suggest two instances instead)</td></tr>
+</table></div>
+<p>LRU in Redis is <em>approximated</em> by sampling a few keys, which saves memory and is close to true LRU in practice<sup class="cite"><a href="https://redis.io/docs/latest/develop/reference/eviction/">[1]</a></sup>. Track your hit rate as <code>keyspace_hits / (keyspace_hits + keyspace_misses)</code> from <code>INFO stats</code>.</p>
+
+<h2>6. Check yourself</h2>
+<section id="q6">
+<div class="quiz" data-explain="Pure caches can always refill from the DB, so evicting the least recently used keys is safe and keeps the popular ones.">
+  <p class="q">Your Redis is a pure cache in front of Postgres. Best eviction policy?</p>
+  <div class="opts"><button class="opt" data-correct>allkeys-lru</button><button class="opt">noeviction</button><button class="opt">volatile-ttl</button><button class="opt">allkeys-random</button></div>
+</div>
+<div class="quiz" data-explain="Delete-then-update lets a concurrent reader put the old row back into the cache before your UPDATE commits.">
+  <p class="q">Which write order can leave stale data in the cache for a whole TTL?</p>
+  <div class="opts"><button class="opt" data-correct>Delete cache, then update DB</button><button class="opt">Update DB, then delete cache</button><button class="opt">Update DB, then await expiry</button><button class="opt">Update DB inside one transaction</button></div>
+</div>
+<div class="quiz" data-explain="An indexed lookup is already sub-millisecond locally. Caching wins most on expensive queries or under heavy concurrent load.">
+  <p class="q">Where does a Redis cache give the biggest win?</p>
+  <div class="opts"><button class="opt">Single primary-key lookups on idle DBs</button><button class="opt" data-correct>Expensive queries under heavy concurrent load</button><button class="opt">Write-heavy tables that change every second</button><button class="opt">Data each user reads only once</button></div>
+</div>
+<p class="score" data-for="q6"></p>
+</section>
+
+<div class="assignment">
+<h3>Assignment 0006: make caching earn its keep</h3>
+<p class="meta">≈15 min · edit <code>labs/0006-postgres-cache/server.js</code></p>
+<ol class="steps">
+  <li>Add <code>GET /stats/top-categories</code> backed by an <em>expensive</em> query, e.g. <code>SELECT left(name, 9) AS bucket, avg(price), count(*) FROM products GROUP BY 1 ORDER BY 2 DESC LIMIT 10</code>. Cache it as one key with a 60 s TTL.</li>
+  <li>Measure uncached vs cached p50 with a small loop like <code>bench.js</code>. Write the two numbers down. This is where the 100× in the video becomes real.</li>
+  <li>Set <code>CONFIG SET maxmemory 2mb</code> and <code>CONFIG SET maxmemory-policy allkeys-lru</code>, run <code>npm run bench 2000</code>, and look at <code>INFO stats</code> for <code>evicted_keys</code> and your hit rate. Reset with <code>CONFIG SET maxmemory 0</code>.</li>
+  <li>Bonus: make Redis errors <em>not</em> fail the request. If <code>redis.get</code> throws, fall back to Postgres.</li>
+</ol>
+<p>Send me your numbers and diff and I'll review them.</p>
+</div>
+
+<div class="source"><h3>Primary source</h3><p><a href="https://redis.io/docs/latest/develop/reference/eviction/">Key eviction</a>. Read “Eviction policies” and “Using the INFO command” (about 8 min).</p></div>
+<div class="ask"><h3>Questions?</h3><p>Ask me “how would I cache a paginated list?” or “should I use the DB's LISTEN/NOTIFY to invalidate?”.</p></div>
+
+<footer class="next">
+  <a href="0005-redis-cluster.html">← 0005</a>
+  <a href="0007-hot-keys.html">0007 · Hot keys →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

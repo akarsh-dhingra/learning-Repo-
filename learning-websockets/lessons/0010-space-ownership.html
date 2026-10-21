@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Space Ownership &amp; Failover</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="../reference/backend-patterns.html">Reference: backend patterns</a> · Lesson 10</nav>
+
+<span class="kicker">Lesson 0010 · Build · ~75 min</span>
+<h1>Space ownership, presence &amp; failover</h1>
+<p class="lede">Pattern B from lesson 0003. Each Gather space lives on exactly one node. A directory tells clients where. When a node dies, its spaces move, and nothing else does.</p>
+
+<div class="win"><strong>You'll build:</strong> a cluster of world nodes that register themselves with heartbeats, a directory service using rendezvous hashing, owner checks (HTTP 421), rebalancing when a node returns, cluster-wide presence, and a client that follows its space wherever it moves. <strong>Done when:</strong> 6/6 checks pass, including a real crash-and-failover.</div>
+
+<h2>1. Why owners, not a backplane, for worlds</h2>
+<p>The 0009 tick needs <em>every</em> player's position in one process's memory: the grid, <code>nearby()</code>, the clamp. Spreading one space across nodes would mean shipping every move through Redis just to rebuild that view everywhere. So route by <strong>space</strong>: all of a space's players connect to its owner, and the owner runs the simulation. Figma does the same for documents and Discord for guilds (lesson 0003).</p>
+<figure>
+<svg viewBox="0 0 640 170" role="img" aria-label="The client asks the directory which node owns a space, the directory computes it from live nodes in Redis, and the client connects directly to that node. Nodes heartbeat into Redis.">
+  <rect class="box" x="10" y="60" width="100" height="44" rx="6"/><text x="60" y="87" text-anchor="middle" font-size="12">client</text>
+  <rect class="hot" x="190" y="10" width="140" height="44" rx="6"/><text x="260" y="30" text-anchor="middle" font-size="12">directory</text><text class="small" x="260" y="46" text-anchor="middle">GET /assign?space=x</text>
+  <rect class="box" x="470" y="10" width="160" height="44" rx="6"/><text x="550" y="30" text-anchor="middle" font-size="12">Redis</text><text class="small" x="550" y="46" text-anchor="middle">node:* (TTL 5s) · presence</text>
+  <rect class="box" x="190" y="110" width="90" height="44" rx="6"/><text x="235" y="137" text-anchor="middle" font-size="12">node-1</text>
+  <rect class="hot" x="300" y="110" width="90" height="44" rx="6"/><text x="345" y="130" text-anchor="middle" font-size="12">node-2</text><text class="small" x="345" y="146" text-anchor="middle">owns x</text>
+  <rect class="box" x="410" y="110" width="90" height="44" rx="6"/><text x="455" y="137" text-anchor="middle" font-size="12">node-3</text>
+  <path class="line" d="M110 75 L190 35"/><text class="small" x="120" y="45">① where is x?</text>
+  <path class="line" d="M330 32 H470"/><text class="small" x="350" y="25">live nodes</text>
+  <path class="line hit" d="M110 92 C200 120 260 140 300 132"/><text class="small" x="140" y="128">② wss:// direct</text>
+  <path class="line miss" d="M500 132 C560 132 590 90 570 54"/><text class="small" x="540" y="100">heartbeat</text>
+</svg>
+</figure>
+
+<h2>2. The four building blocks</h2>
+<h3>Membership: TTL heartbeats</h3>
+<pre>const beat = () =&gt; redis.send("SET", [`node:${id}`, url, "EX", "5"]);
+beat(); setInterval(beat, 1500);   <span class="c">// crash = stop refreshing = key expires within 5s = gone</span></pre>
+<p>No one has to detect the crash. Absence <em>is</em> the signal. Pick the TTL as a trade-off: shorter means faster failover but more false alarms on a GC pause.</p>
+<h3>Ownership: rendezvous hashing</h3>
+<pre>export function ownerOf(space: string, nodes: Node[]) {
+  let best, bestScore = -1n;
+  for (const n of nodes) {
+    const score = BigInt(Bun.hash(`${space}|${n.id}`));  <span class="c">// deterministic in every process</span>
+    if (score &gt; bestScore) { best = n; bestScore = score; }
+  }
+  return best;
+}</pre>
+<p>Every process computes the same owner with no coordination. When a node leaves, only <em>its</em> spaces get a new highest score, and everyone else's winner is unchanged. Consistent hashing with a ring gives the same property. Rendezvous is just shorter to write<sup class="cite"><a href="https://en.wikipedia.org/wiki/Rendezvous_hashing">[1]</a></sup>.</p>
+<h3>Enforcement: 421 and 4010</h3>
+<ul>
+  <li>On upgrade, a node computes <code>ownerOf(space)</code>. If it isn't the owner, it returns <strong>HTTP 421 Misdirected Request</strong>, and the client asks the directory again. Stale routing is detected, not trusted.</li>
+  <li>Every second, a node refreshes membership. If a space it hosts now belongs to someone else (a node came back), it closes those sockets with <strong><code>4010 space moved</code></strong>, and the clients follow.</li>
+  <li>Cap players per space (HTTP 503 when full). A hot space must not take its node down.</li>
+</ul>
+<h3>Presence: sorted set with heartbeat scores</h3>
+<pre>ZADD presence:{space} &lt;now&gt; '{"id":"…","name":"…"}'           <span class="c">// on join, and every 5s for local players</span>
+ZREM presence:{space} '{"id":"…","name":"…"}'                 <span class="c">// on leave</span>
+ZRANGEBYSCORE presence:{space} &lt;now − 15s&gt; +inf              <span class="c">// "who's online": stale = crashed node, ignored</span></pre>
+<p>This fixes 0008's leak: a crashed node never runs its cleanup, but its entries stop being refreshed and fall out of the window.</p>
+
+<h2>3. Build it</h2>
+<p>New folder: <code>build/world-cluster</code>, starting from your 0009 world. Reference: <code>labs/0010-space-ownership/</code> (<code>cluster.ts</code>, <code>directory.ts</code>, <code>space-node.ts</code>). Changes to make:</p>
+<ol class="steps">
+  <li>Turn the single world into <code>Map&lt;spaceId, { players, grid }&gt;</code>, chosen by <code>?space=</code>. The tick loops over spaces.</li>
+  <li><code>cluster.ts</code>: <code>liveNodes()</code>, <code>ownerOf()</code>, <code>startHeartbeat()</code>, <code>onlineIn()</code>.</li>
+  <li><code>directory.ts</code>: <code>/assign</code>, <code>/nodes</code>, <code>/presence</code>, and it serves the page. It holds no sockets at all.</li>
+  <li>Node: owner check (421), capacity (503), rebalance (4010), presence writes, and <code>POST /__crash</code> for the failover test (dev only).</li>
+  <li>Client: <code>fetch("/assign")</code> → connect → on any close, backoff and <em>ask the directory again</em>.</li>
+</ol>
+
+<h2>4. Run, crash, watch</h2>
+<pre>cd ~/learning-websockets/labs/0010-space-ownership
+./start-cluster.sh                  <span class="c"># Redis :6390, directory :9000, nodes :9001-9003</span>
+open "http://localhost:9000/?space=lobby&amp;name=akarsh"
+curl "localhost:9000/assign?space=lobby"           <span class="c"># which node? kill it:</span>
+curl -X POST localhost:9002/__crash                <span class="c"># if it was node-2</span>
+<span class="c"># the page shows "closed (1006)… asking the directory again", then lands on another node within ~5s</span>
+./start-cluster.sh node-2                          <span class="c"># bring it back: lobby moves BACK (4010) automatically</span>
+bun test check.test.ts                             <span class="c"># the last test crashes a node on purpose</span></pre>
+<p>Verified while building this lesson: a browser in <code>lobby</code> on node-1 followed the space to node-2 by itself when node-2 rejoined, and presence showed exactly one entry.</p>
+
+<h2>5. Check yourself</h2>
+<section id="quiz10">
+<div class="quiz" data-explain="Rendezvous hashing: removing a node only changes the winner for keys that node was winning. Every other space keeps its owner.">
+  <p class="q">Node-3 of 3 dies. With rendezvous hashing, which spaces move?</p>
+  <div class="opts">
+    <button class="opt">About two thirds of spaces</button>
+    <button class="opt" data-correct>Only the spaces node-3 owned</button>
+    <button class="opt">Every space, to rebalance load</button>
+    <button class="opt">None until an operator acts</button>
+  </div>
+</div>
+<div class="quiz" data-explain="Clients cache assignments and membership changes. 421 turns a stale route into a quick retry through the directory instead of a split-brain space.">
+  <p class="q">Why does a node reject non-owned spaces with 421 instead of hosting them?</p>
+  <div class="opts">
+    <button class="opt">Bun limits each node to few spaces</button>
+    <button class="opt" data-correct>Two nodes would run the same space</button>
+    <button class="opt">Redis rejects writes from the other nodes</button>
+    <button class="opt">The directory would then stop all traffic</button>
+  </div>
+</div>
+<div class="quiz" data-explain="Positions are ephemeral, so losing them on a crash is acceptable: players reappear when they reconnect. Durable state (chat history, objects placed in the space) must be persisted outside the node.">
+  <p class="q">The owner of a space crashes. What do its players lose?</p>
+  <div class="opts">
+    <button class="opt" data-correct>In-memory state like positions, briefly</button>
+    <button class="opt">Their accounts and login sessions</button>
+    <button class="opt">Nothing; Redis holds every position</button>
+    <button class="opt">The space itself, permanently deleted</button>
+  </div>
+</div>
+<p class="score" data-for="quiz10"></p>
+</section>
+
+<h2>6. System-design rep</h2>
+<p>5 minutes on paper: <em>“Design the realtime layer of a Gather-like product: 50k concurrent users, 5k spaces, the biggest has 500 people.”</em> Then compare.</p>
+<details class="recall"><summary>A strong answer covers…</summary>
+<ul>
+  <li>Pattern B. Space owners chosen by rendezvous/consistent hashing over live nodes, a directory for lookup, and clients connecting directly (or via an LB that routes by space).</li>
+  <li>Inside a space: authoritative 10 Hz tick, grid-based interest management, proximity chat (0009).</li>
+  <li>Sizing: say 2k sockets and ~20 spaces per node at the measured costs, so ~25–40 nodes with headroom. The 500-person space is the hot spot: cap it, and give it its own node if needed.</li>
+  <li>Failure: heartbeat TTL → reassignment in ~5 s; clients re-ask the directory with jittered backoff. Positions are rebuilt from reconnecting clients, and durable space data lives in a DB.</li>
+  <li>Presence via TTL'd heartbeats. A/V goes over WebRTC/SFU, with the socket layer only doing signaling.</li>
+</ul></details>
+
+<div class="assignment">
+<h3>Assignment A10</h3>
+<p class="meta">~60 min · build/world-cluster</p>
+<ol>
+  <li>Get 6/6 checks green against your cluster (restart the crashed node afterwards).</li>
+  <li>Graceful handoff: on SIGTERM, a node deletes its <code>node:</code> key <em>first</em>, waits 1.5 s, then closes its sockets with 4010. Why is that better for users than just exiting?</li>
+  <li>Add <code>GET /presence/all</code> to the directory: total online users across all spaces. What's the cheapest way to compute it?</li>
+</ol>
+</div>
+
+<div class="source">
+<h3>Primary source</h3>
+<p><a href="https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users">How Discord Scaled Elixir to 5,000,000 Concurrent Users</a>: one process per guild, sessions fanning out, and the hot-guild problems. Then Slack's <a href="https://slack.engineering/real-time-messaging/">Real-time Messaging</a> for consistent hashing plus a ring manager that replaces failed channel servers in under 20 s.</p>
+</div>
+
+<div class="ask"><h3>Stuck on anything?</h3><p>Ask me in the terminal. For example: “how would I do this on Kubernetes with a StatefulSet?”, “what if Redis itself is down?”, or “consistent hashing ring vs rendezvous at 1,000 nodes?”</p></div>
+
+<footer class="next">
+  <a href="0009-world-interest-management.html">← Lesson 0009 · Gather-style world</a>
+  <a href="0011-orderbook-feed.html">Next: Lesson 0011 · CEX order-book feed →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

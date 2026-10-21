@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CEX Order-Book Feed</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="../reference/backend-patterns.html">Reference: backend patterns</a> · Lesson 11</nav>
+
+<span class="kicker">Lesson 0011 · Build · ~90 min</span>
+<h1>A CEX market-data gateway with gap-free order books</h1>
+<p class="lede">An exchange's socket layer has one writer (the matching engine) and a huge number of readers who must hold an <em>exact</em> copy of the book. Missing one diff isn't laggy, it's wrong.</p>
+
+<div class="win"><strong>You'll build:</strong> a market-data gateway (Pattern A, run two of them) with subscribe/unsubscribe streams, a REST snapshot endpoint, private per-user order streams, a token-bucket rate limit, and the client-side <code>LocalBook</code> that syncs from snapshot + diffs and detects gaps. <strong>Done when:</strong> 8/8 gateway checks and 5/5 <code>LocalBook</code> unit tests pass, and the UI stays “in sync” with simulated packet loss on.</div>
+
+<h2>1. The shape of exchange data</h2>
+<div class="table-wrap"><table>
+  <tr><th>Stream</th><th>Who</th><th>Semantics</th><th>Pattern</th></tr>
+  <tr><td><code>BTC-USD@depth</code></td><td>public, huge fan-out</td><td>diffs <code>{U, u, b, a}</code>: ids <code>U…u</code>, qty <code>"0"</code> = remove level</td><td>A: any gateway, backplane by symbol</td></tr>
+  <tr><td><code>BTC-USD@trade</code></td><td>public</td><td>append-only events; a missed one is a cosmetic loss</td><td>A</td></tr>
+  <tr><td><code>user</code> (private)</td><td>one user, all their tabs and bots</td><td><code>order.accepted</code>, <code>order.filled</code></td><td>A: channel <code>user:{id}</code></td></tr>
+  <tr><td><code>GET /depth</code></td><td>REST</td><td>snapshot <code>{lastUpdateId, bids, asks}</code></td><td>plain HTTP, cacheable</td></tr>
+</table></div>
+<p>The lab includes a fake matching engine (<code>engine.ts</code>). It isn't the lesson. It just publishes realistic diffs every 50 ms to Redis (<code>md:{sym}:depth</code>), stores a snapshot, and answers orders on <code>user:{id}</code>. Because there's exactly <strong>one writer</strong>, update ids are a total order per symbol for free.</p>
+
+<h2>2. The sync algorithm (the part interviewers ask about)</h2>
+<p>Straight from Binance's documentation, “How to manage a local order book correctly”<sup class="cite"><a href="https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md">[1]</a></sup>:</p>
+<ol class="steps">
+  <li>Open the stream and <strong>buffer</strong> diffs. Note the <code>U</code> of the first one.</li>
+  <li>Fetch the REST snapshot.</li>
+  <li>If <code>snapshot.lastUpdateId</code> &lt; first <code>U</code> − 1, the snapshot is too old: fetch again.</li>
+  <li>Discard buffered diffs with <code>u ≤ lastUpdateId</code>. The snapshot already contains them.</li>
+  <li>Set the book to the snapshot, then apply the remaining buffered diffs, then live ones.</li>
+  <li>While live: if a diff's <code>U</code> &gt; your <code>lastUpdateId + 1</code>, you missed something. <strong>Throw the book away and resync.</strong></li>
+</ol>
+<p>It's the same subscribe-then-snapshot ordering you used in 0008. That's not a coincidence: it's <em>the</em> pattern for “state + live updates” over any lossy pipe.</p>
+<pre>onDiff(diff) {
+  if (!this.synced) return void this.buffer.push(diff);
+  if (diff.u &lt;= this.lastUpdateId) return;                  <span class="c">// old</span>
+  if (diff.U &gt; this.lastUpdateId + 1) {                     <span class="c">// GAP: book is now wrong</span>
+    this.stats.gaps++; this.synced = false; this.buffer = [diff]; this.sync(); return;
+  }
+  this.apply(diff);
+}
+async sync() {
+  for (;;) {
+    const snap = await this.fetchSnapshot();
+    if (this.buffer[0] &amp;&amp; snap.lastUpdateId &lt; this.buffer[0].U - 1) continue;   <span class="c">// too old, again</span>
+    this.bids = new Map(snap.bids); this.asks = new Map(snap.asks); this.lastUpdateId = snap.lastUpdateId;
+    const pending = this.buffer.filter((d) =&gt; d.u &gt; snap.lastUpdateId);
+    this.buffer = []; this.synced = true;
+    pending.forEach((d) =&gt; this.onDiff(d));
+    return;
+  }
+}</pre>
+
+<h2>3. Build it</h2>
+<p>New folder <code>build/exchange</code>. Copy <code>engine.ts</code> and <code>auth.ts</code> from <code>labs/0011-orderbook-feed/</code> as-is, and write the gateway and <code>LocalBook</code> yourself.</p>
+<h3>Gateway spec (what the checks test)</h3>
+<ul>
+  <li><code>GET /depth?symbol=</code> → the snapshot JSON from Redis <code>md:{sym}:book</code>. <code>POST /login</code> → <code>{token}</code>.</li>
+  <li>Upgrade with an optional <code>?token=</code>: none means anonymous (public data only), and a <em>bad</em> token means 401. Send <code>welcome {node, authenticated, symbols}</code>.</li>
+  <li><code>subscribe {streams}</code> / <code>unsubscribe {streams}</code>: names like <code>BTC-USD@depth</code>, validated with Zod, at most 20 per connection, acked with the current list. Ref-counted Redis subscriptions per stream, exactly like 0008's <code>attach</code>/<code>detach</code>. Events go out as <code>{type:"depth"|"trade", stream, data}</code>.</li>
+  <li>Authenticated sockets are auto-subscribed to <code>user:{sub}</code>. <code>order.place</code> (validated) → publish to <code>orders:in</code> → ack <code>{status:"submitted"}</code>. The fill arrives later on the private stream. Anonymous → <code>forbidden</code>.</li>
+  <li><strong>Rate limit</strong>: a token bucket per socket (burst 10, refill 5/s). Over the limit → error <code>rate_limited</code> and close <code>1008</code>. Binance documents a 5 msg/s inbound limit for the same reason<sup class="cite"><a href="https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md">[1]</a></sup>.</li>
+</ul>
+<pre>function allow(ws) {                         <span class="c">// token bucket: refill by elapsed time, spend one per message</span>
+  const now = performance.now();
+  ws.data.tokens = Math.min(10, ws.data.tokens + ((now - ws.data.lastRefill) / 1000) * 5);
+  ws.data.lastRefill = now;
+  if (ws.data.tokens &lt; 1) return false;
+  ws.data.tokens -= 1; return true;
+}</pre>
+
+<h2>4. Run and check it</h2>
+<pre>cd ~/learning-websockets/labs/0011-orderbook-feed
+./start.sh                       <span class="c"># Redis :6390, engine, gateways :7001 and :7002</span>
+bun test book.test.ts            <span class="c"># unit tests for LocalBook  (BOOK=/path/to/yours.js)</span>
+bun test check.test.ts           <span class="c"># gateway checks            (URL=… URL2=… for yours)</span>
+open http://localhost:7001       <span class="c"># tick "simulate packet loss" and watch gaps → resyncs → still correct</span>
+./stop.sh</pre>
+<p>The strongest check syncs a <code>LocalBook</code> from the live feed, fetches a <em>later</em> snapshot, and requires the two books to be identical, level for level. Another drops one diff on purpose and requires exactly one gap, a resync, and a correct book afterwards. When building this lab, the UI with 5% loss showed “in sync · gaps detected 5 · syncs 6”.</p>
+
+<h2>5. Check yourself</h2>
+<section id="quiz11">
+<div class="quiz" data-explain="If you fetch first, diffs published between the snapshot and your subscription are lost forever. Subscribing first means every diff after that point is buffered.">
+  <p class="q">Why subscribe to diffs <em>before</em> fetching the snapshot?</p>
+  <div class="opts">
+    <button class="opt">The REST endpoint requires an open socket</button>
+    <button class="opt" data-correct>Diffs between snapshot and subscribe would vanish</button>
+    <button class="opt">Snapshots are only sent over the socket</button>
+    <button class="opt">It makes the snapshot response much smaller</button>
+  </div>
+</div>
+<div class="quiz" data-explain="U = 1006 means 1003–1005 are missing. You can't patch a book you know is wrong; resync from a fresh snapshot.">
+  <p class="q">Local <code>lastUpdateId</code> is 1002. A diff arrives with <code>U=1006, u=1008</code>. Do what?</p>
+  <div class="opts">
+    <button class="opt">Apply it, then keep going</button>
+    <button class="opt">Ignore it as stale data</button>
+    <button class="opt" data-correct>Discard the book and resync</button>
+    <button class="opt">Wait for diff 1003 first</button>
+  </div>
+</div>
+<div class="quiz" data-explain="The private channel is keyed by user id, so every gateway holding one of that user's sockets subscribes to it, and the engine never needs to know where the user is connected.">
+  <p class="q">A user has a browser on gateway 1 and a bot on gateway 2. A fill happens. How does it reach both?</p>
+  <div class="opts">
+    <button class="opt">The engine sends to each gateway directly</button>
+    <button class="opt" data-correct>Both gateways subscribe to user:{id} in Redis</button>
+    <button class="opt">Gateway 1 forwards fills to gateway 2</button>
+    <button class="opt">The bot polls REST for its fills</button>
+  </div>
+</div>
+<p class="score" data-for="quiz11"></p>
+</section>
+
+<h2>6. System-design rep</h2>
+<p>5 minutes: <em>“Design market data for an exchange with 300 symbols and 2M connected clients. The BTC book changes 2,000 times a second.”</em></p>
+<details class="recall"><summary>A strong answer covers…</summary>
+<ul>
+  <li>One writer per symbol (the matching engine), publishing sequenced diffs to a durable log (Kafka, or an internal multicast bus) partitioned by symbol, not Redis Pub/Sub.</li>
+  <li>Fan-out tiers: engine → regional relays → thousands of stateless gateways. Each gateway subscribes once per symbol it has clients for, and serialises once per symbol, not per client.</li>
+  <li>Conflation for slow or retail clients: <code>@depth20@100ms</code> snapshots instead of every diff. Full diffs only for clients that keep up, with disconnect on lag.</li>
+  <li>Snapshots served from cache/CDN with <code>lastUpdateId</code>. Clients run the buffer → snapshot → apply → gap-resync algorithm.</li>
+  <li>Private streams by user id, authenticated with short-lived listen keys. Per-connection rate limits, a stream cap, and a 24 h max connection lifetime (Binance documents all three).</li>
+</ul></details>
+
+<div class="assignment">
+<h3>Assignment A11</h3>
+<p class="meta">~60 min · build/exchange</p>
+<ol>
+  <li>Pass both test files against your gateway and your <code>LocalBook</code>.</li>
+  <li>Add a conflated stream <code>BTC-USD@depth10@250ms</code>: every 250 ms, publish the top 10 levels as a full snapshot (no ids needed). Which clients should use it, and why does it need no gap handling?</li>
+  <li>The engine publishes the diff and <em>then</em> writes the snapshot, as two Redis calls. Explain why the client algorithm stays correct even when a snapshot is fetched between the two.</li>
+</ol>
+</div>
+
+<div class="source">
+<h3>Primary source</h3>
+<p>Binance Spot <a href="https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md">WebSocket Streams</a>: read “General WSS information” (connection limits, pings, 24 h lifetime), the Diff. Depth Stream, and “How to manage a local order book correctly”. For comparison, Coinbase's <a href="https://docs.cdp.coinbase.com/exchange/websocket-feed/channels">Exchange WebSocket channels</a> (their <code>level2</code> channel uses <code>snapshot</code> + <code>l2update</code>).</p>
+</div>
+
+<div class="ask"><h3>Stuck on anything?</h3><p>Ask me in the terminal. For example: “how would sequence numbers work for the private stream?”, “why not just send full books every 100 ms?”, or paste a failing test.</p></div>
+
+<footer class="next">
+  <a href="0010-space-ownership.html">← Lesson 0010 · Space ownership</a>
+  <a href="0012-operating-it.html">Next: Lesson 0012 · Operating it →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

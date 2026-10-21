@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis Course Map</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<span class="kicker">Course map</span>
+<h1>Redis, from cache to locks</h1>
+<p class="lede">Ten lessons following the video section by section, each 20–25 minutes, plus one dedicated assignment on distributed locking.</p>
+
+<p><strong>Goal</strong> (from <code>MISSION.md</code>): explain Redis confidently in system-design interviews <em>and</em> use it in your own Node backends. Every lesson ends with an interview rep and a hands-on assignment.</p>
+
+<p><strong>How to study each lesson fast and well:</strong> read the knowledge sections once, then do the quizzes and recall prompts <em>without scrolling back up</em>, then do the assignment. Paste assignment answers to Claude in the terminal for review. Come back to the quizzes two days later. Remembering something after a gap is what makes it stick.</p>
+
+<h2>Part I · Caching</h2>
+<ul class="map">
+  <li><input type="checkbox" data-id="0001" aria-label="done"><span><a href="0001-why-cache-and-what-redis-is.html">0001 · Why cache, and why Redis is fast</a><span class="sub">Cache-aside, in-memory, single-threaded execution, RDB vs AOF · hit/miss drill</span></span><span class="t">20 min · 0:00–7:00</span></li>
+  <li><input type="checkbox" data-id="0002" aria-label="done"><span><a href="0002-first-commands-and-cache-aside-in-node.html">0002 · Run Redis, then cache a slow API</a><span class="sub">SET/GET/TTL/INCR gotchas · Node lab</span></span><span class="t">25 min · 7:00–18:00</span></li>
+  <li><input type="checkbox" data-id="0003" aria-label="done"><span><a href="0003-data-structures-toolkit.html">0003 · Pick the right structure</a><span class="sub">Strings, lists, hashes, sets, sorted sets, geo, Pub/Sub vs Streams · mini BookMyShow model</span></span><span class="t">25 min · ≈18–31</span></li>
+</ul>
+
+<h2>Part II · Running Redis in production</h2>
+<ul class="map">
+  <li><input type="checkbox" data-id="0004" aria-label="done"><span><a href="0004-consistency-and-replication.html">0004 · Stale reads, replicas, and failover</a><span class="sub">Eventual consistency, invalidation, async replication, WAIT · replica lab</span></span><span class="t">20 min · ≈31–34</span></li>
+  <li><input type="checkbox" data-id="0005" aria-label="done"><span><a href="0005-redis-cluster.html">0005 · Redis Cluster: slots, redirects, failover</a><span class="sub">16384 slots, hash tags, MOVED vs ASK, gossip · live slot calculator · 6-node cluster lab</span></span><span class="t">25 min · ≈34–42</span></li>
+  <li><input type="checkbox" data-id="0006" aria-label="done"><span><a href="0006-caching-postgres-for-real.html">0006 · Caching Postgres for real</a><span class="sub">1M rows, invalidation on write, eviction policies, honest p50/p95</span></span><span class="t">25 min · ≈42–51</span></li>
+  <li><input type="checkbox" data-id="0007" aria-label="done"><span><a href="0007-hot-keys.html">0007 · Hot keys</a><span class="sub">Replica reads, key splitting, local cache, stampedes, <code>--hotkeys</code></span></span><span class="t">20 min · ≈51–54</span></li>
+</ul>
+
+<h2>Part III · Coordination</h2>
+<ul class="map">
+  <li><input type="checkbox" data-id="0008" aria-label="done"><span><a href="0008-rate-limiting.html">0008 · Rate limiting</a><span class="sub">Atomic fixed window (Lua), boundary bursts, sliding-window log · Express lab</span></span><span class="t">25 min · ≈54–58</span></li>
+  <li><input type="checkbox" data-id="0009" aria-label="done"><span><a href="0009-distributed-locks-done-right.html">0009 · Distributed locks I: a correct lock</a><span class="sub">What's wrong with the video's INCR lock · SET NX PX + token · compare-and-delete</span></span><span class="t">25 min · ≈58–end</span></li>
+  <li><input type="checkbox" data-id="0010" aria-label="done"><span><a href="0010-leases-fencing-and-redlock.html">0010 · Distributed locks II: leases, fencing, Redlock</a><span class="sub">Paused clients, failover, fencing tokens, Redlock vs Kleppmann, when not to use Redis</span></span><span class="t">25 min · beyond the video</span></li>
+  <li class="special"><input type="checkbox" data-id="A1" aria-label="done"><span><a href="../assignments/A1-seat-hold-lock/brief.html"><strong>Assignment A1 · Seat-hold lock that can't double-book</strong></a><span class="sub">15 automated tests (Redis-backed) + 8 written design questions · the deep dive on topic 9</span></span><span class="t">2–3 h</span></li>
+</ul>
+
+<h2>Reference sheets</h2>
+<ul>
+  <li><a href="../reference/redis-basics.html">Redis basics</a>: cache-aside, TTL rules, persistence, node-redis</li>
+  <li><a href="../reference/data-structures.html">Data structures</a>: type → commands → use case</li>
+  <li><a href="../reference/cluster.html">Cluster</a>: slots, hash tags, redirects, failover</li>
+  <li><a href="../reference/locks-and-limits.html">Locks &amp; limits</a>: every script from 0008–0010 and A1 on one page</li>
+</ul>
+
+<h2>What's running on your machine</h2>
+<div class="table-wrap"><table>
+  <tr><th>Container</th><th>Used by</th><th>Start again</th></tr>
+  <tr><td><code>redis-stack</code> · 6379 / UI 8001</td><td>Everything</td><td><code>docker start redis-stack</code></td></tr>
+  <tr><td><code>postgres-db</code> · 5432 · 1M rows seeded</td><td>0006, 0007, A1 stretch</td><td><code>docker start postgres-db</code></td></tr>
+  <tr><td><code>redis-cluster</code> (on demand)</td><td>0005</td><td><code>sh labs/0005-cluster/start-cluster.sh</code></td></tr>
+</table></div>
+
+<div class="ask"><h3>Your teacher is in the terminal</h3><p>Ask anything, paste assignment work for review, or say “quiz me on 0001–0005” for a mixed review session.</p></div>
+</main>
+<script>
+  // Per-viewer progress ticks; safe to lose.
+  document.querySelectorAll(".map input[type=checkbox]").forEach((box) => {
+    const k = "redis-course:" + box.dataset.id;
+    try { box.checked = localStorage.getItem(k) === "1"; } catch (e) {}
+    box.addEventListener("change", () => { try { localStorage.setItem(k, box.checked ? "1" : "0"); } catch (e) {} });
+  });
+</script>
+</body>
+</html>

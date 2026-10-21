@@ -1,0 +1,7 @@
+[node-1] whiteboard node on http://localhost:8081/?room=demo
+unsubscribe load-147 failed: RedisError: Connection closed
+ code: "ERR_REDIS_CONNECTION_CLOSED"
+
+
+[node-1] draining (SIGTERM): 0 sockets over 5000ms
+[node-1] drained, exiting

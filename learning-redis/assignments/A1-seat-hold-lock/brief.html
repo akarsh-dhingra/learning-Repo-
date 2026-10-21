@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A1 Seat-Hold Lock</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="../../lessons/index.html">Course map</a> · Prereqs: <a href="../../lessons/0009-distributed-locks-done-right.html">Lesson 0009</a>, <a href="../../lessons/0010-leases-fencing-and-redlock.html">Lesson 0010</a></nav>
+
+<span class="kicker">Dedicated assignment A1 · 2–3 hours</span>
+<h1>Build a seat-hold lock that can't double-book</h1>
+<p class="lede">BookMyShow, the video's example. Fifty people tap the same seat in the same instant. Exactly one of them should get it, even when a server freezes partway through a payment.</p>
+
+<div class="win"><strong>When you're done:</strong> <code>npm test</code> shows 15/15, and you can defend every line in an interview: why the token is random, why release is a script, why the fence exists, and when you wouldn't use Redis for this at all.</div>
+
+<h2>0. See the bug first (2 min)</h2>
+<pre>cd ~/learning-redis/assignments/A1-seat-hold-lock
+npm run race</pre>
+<p>This books one seat for 50 users with no lock. When I ran it, <strong>38 people</strong> were told they got seat A1. That's the bug you're fixing.</p>
+
+<h2>1. The rules</h2>
+<ul>
+  <li>Edit only <code>src/lock.js</code> and <code>src/booking.js</code>. The TODOs tell you what each function must do.</li>
+  <li>Redis must be running on <code>localhost:6379</code> (the <code>redis-stack</code> container from Lesson 0002). The tests use logical DB 15 and flush it, so your DB 0 keys are safe.</li>
+  <li><code>.solution/</code> holds a reference solution. Don't open it until you pass on your own, or until you've been stuck on one part for 30 honest minutes. Looking early swaps real understanding for the feeling of it.</li>
+</ul>
+
+<h2>2. Work through the parts in order</h2>
+<p>Run <code>npm test</code> after each part. Each test describes a real failure, so read its name when it goes red.</p>
+<div class="table-wrap"><table>
+  <tr><th>Part</th><th>You build</th><th>The failure it prevents</th></tr>
+  <tr><td>1 · acquire</td><td><code>SET … NX PX</code> with a random token, and a fencing token issued in the <em>same atomic step</em></td><td>Two holders at once; a crashed holder blocking the seat forever</td></tr>
+  <tr><td>2 · release</td><td>A delete that only happens if the token still matches (Lua script)</td><td>A slow client deleting the <em>next</em> holder's lock (the video's plain <code>DEL</code>)</td></tr>
+  <tr><td>3 · fencing</td><td><code>SeatDB.writeSeat</code> rejects writes with an older fence than it has already seen</td><td>A paused client waking up and overwriting a newer booking</td></tr>
+  <tr><td>4 · extend</td><td>A PEXPIRE that only happens if the token still matches</td><td>Extending a lock you no longer own</td></tr>
+  <tr><td>5 · withLock / bookSeat</td><td>Retries with random delay, always release in <code>finally</code>, read-then-write inside the lock</td><td>Leaked locks on exceptions; 38 winners instead of 1</td></tr>
+  <tr><td>6 · pause scenario</td><td>Nothing new. This test passes once parts 1–5 are right.</td><td>The GC-pause case from Lesson 0010</td></tr>
+</table></div>
+
+<h2>3. Hints (open only when stuck)</h2>
+<details class="recall"><summary>Part 1: how do I run a script from node-redis?</summary>
+<pre>await redis.eval(SCRIPT, { keys: [k1, k2], arguments: [a1, String(a2)] });</pre>
+Arguments must be strings. Inside Lua, <code>redis.call("set", KEYS[1], ARGV[1], "NX", "PX", ARGV[2])</code> returns a falsy value when NX blocks the write.</details>
+<details class="recall"><summary>Part 1: why can't I INCR the fence before or after the SET as a separate call?</summary>
+Before: failed acquires bump the counter (a test checks for this). After: a client can stall between its SET and its INCR. Its lease can expire and someone else can acquire and INCR, and then the stalled client gets the <em>higher</em> fence even though it's the stale one. Do both in one script.</details>
+<details class="recall"><summary>Part 2: what's the release script?</summary>
+Get the key and compare it with your token. Delete only if they're equal, otherwise return 0. Redis 8.4+ has a single command for this (<code>DELEX key IFEQ token</code>), but your container runs 7.4, so use Lua. <a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">Redis docs</a></details>
+<details class="recall"><summary>Part 3: &lt; or ≤?</summary>
+Reject <code>fence &lt; last</code>. The same holder writing twice with the same fence is legitimate.</details>
+<details class="recall"><summary>Part 5: the 50-user test says 0 winners</summary>
+Your retry budget runs out before the first holder releases. Everyone else should get <code>"taken"</code> (they got the lock after the winner) or <code>"busy"</code> (they gave up), but somebody must win. Check that you actually release in <code>finally</code> and that you sleep between attempts.</details>
+
+<h2>4. Written part: DESIGN.md</h2>
+<p>Answer the questions in <code>DESIGN.md</code> in your own words, 2–5 sentences each. This is the part that gets you through the interview. Then paste your answers to me in the terminal and I'll grade them.</p>
+
+<h2>5. Stretch goals (optional)</h2>
+<ol class="steps">
+  <li><strong>Auto-extend (watchdog):</strong> in <code>withLock</code>, extend the lease every <code>ttl/3</code> while <code>fn</code> runs, and stop when it finishes. Add a test where <code>fn</code> takes 3× the TTL and still holds the lock.</li>
+  <li><strong>Seat hold with payment:</strong> model the real flow. <code>holdSeat</code> takes the lock with a 10-minute TTL, <code>confirmPayment(lock)</code> writes the booking with the fence and releases, and <code>abandon</code> just lets the TTL expire. Which of these needs the fence?</li>
+  <li><strong>Postgres version:</strong> do the same race with <code>SELECT … FOR UPDATE</code> or a <code>UNIQUE(seat_id)</code> constraint in the Postgres container from Lesson 0006. Compare the code size. Which would you ship?</li>
+</ol>
+
+<div class="ask">
+<h3>Stuck, or finished?</h3>
+<p>Paste the failing test output or your <code>DESIGN.md</code> answers in the terminal. I'll explain the failure or grade the answers. Don't paste the solution folder.</p>
+</div>
+</main>
+</body>
+</html>

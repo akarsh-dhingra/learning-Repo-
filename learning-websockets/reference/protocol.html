@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebSocket Protocol Sheet</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body class="ref">
+<main>
+<nav class="crumbs"><a href="../lessons/index.html">Course map</a> · Reference · taught in <a href="../lessons/0001-what-a-websocket-really-is.html">Lesson 0001</a></nav>
+<span class="kicker">Reference · RFC 6455</span>
+<h1>WebSocket protocol cheat sheet</h1>
+
+<div class="cols">
+<section>
+<h2>Handshake (§1.3, §4)</h2>
+<pre>GET /path HTTP/1.1
+Host: example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: &lt;16 random bytes, base64&gt;
+Sec-WebSocket-Version: 13
+Origin: https://app.example.com      <span class="c">← check it</span>
+Sec-WebSocket-Protocol: v1.json      <span class="c">← optional</span>
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: &lt;see below&gt;</pre>
+<pre>accept = base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+"dGhlIHNhbXBsZSBub25jZQ==" → "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="</pre>
+<p>Not authentication. Do auth and Origin checks <em>before</em> sending 101. Schemes: <code>ws://</code> (80), <code>wss://</code> (443, TLS). Always use <code>wss</code> in production.</p>
+
+<h2>Frame header (§5.2)</h2>
+<pre>byte 0:  FIN(1) RSV1-3(3) opcode(4)
+byte 1:  MASK(1) len(7)
+         len 0–125 → actual length
+         len 126   → + 2-byte length (≤ 65,535)
+         len 127   → + 8-byte length
++ 4-byte masking key   if MASK=1
++ payload
+header size: 2 … 14 bytes</pre>
+<p>Example: server sends “Hello” → <code>81 05 48 65 6c 6c 6f</code></p>
+
+<h2>Masking (§5.3, §10.3)</h2>
+<pre>client → server: MASK=1 always, fresh random key
+server → client: MASK=0 always
+unmask: payload[i] ^= key[i % 4]</pre>
+<p>Purpose: stops script from writing chosen bytes that a broken proxy could cache (cache poisoning). Not encryption.</p>
+</section>
+
+<section>
+<h2>Opcodes</h2>
+<table>
+<tr><th>Hex</th><th>Type</th><th>Note</th></tr>
+<tr><td><code>0x0</code></td><td>continuation</td><td>next fragment of a message</td></tr>
+<tr><td><code>0x1</code></td><td>text</td><td>must be valid UTF-8</td></tr>
+<tr><td><code>0x2</code></td><td>binary</td><td>MessagePack, protobuf…</td></tr>
+<tr><td><code>0x8</code></td><td>close</td><td>2-byte code + reason</td></tr>
+<tr><td><code>0x9</code></td><td>ping</td><td>reply with pong, same data</td></tr>
+<tr><td><code>0xA</code></td><td>pong</td><td>also usable as one-way heartbeat</td></tr>
+</table>
+<p>Control frames (≥ 0x8): payload ≤ 125 bytes, never fragmented, may arrive between the fragments of a data message.</p>
+
+<h2>Close codes (§7.4.1)</h2>
+<table>
+<tr><th>Code</th><th>Meaning</th></tr>
+<tr><td><code>1000</code></td><td>Normal closure</td></tr>
+<tr><td><code>1001</code></td><td>Going away (tab closed, server shutdown/deploy)</td></tr>
+<tr><td><code>1002</code></td><td>Protocol error (e.g. unmasked client frame)</td></tr>
+<tr><td><code>1003</code></td><td>Unsupported data type</td></tr>
+<tr><td><code>1005</code></td><td>No status present. <em>Never sent on the wire</em></td></tr>
+<tr><td><code>1006</code></td><td>Abnormal: no close frame (network drop, crash). <em>Never sent on the wire</em></td></tr>
+<tr><td><code>1007</code></td><td>Invalid payload (bad UTF-8 in a text frame)</td></tr>
+<tr><td><code>1008</code></td><td>Policy violation (auth, rate limit)</td></tr>
+<tr><td><code>1009</code></td><td>Message too big</td></tr>
+<tr><td><code>1011</code></td><td>Internal server error</td></tr>
+<tr><td><code>1015</code></td><td>TLS handshake failure. <em>Never sent on the wire</em></td></tr>
+<tr><td><code>4000–4999</code></td><td>Yours, for app-specific reasons</td></tr>
+</table>
+
+<h2>Push techniques compared</h2>
+<table>
+<tr><th>Tech</th><th>Direction</th><th>Use when</th></tr>
+<tr><td>Short poll</td><td>client asks</td><td>rare updates, delay OK</td></tr>
+<tr><td>Long poll</td><td>client asks, server holds</td><td>fallback on hostile networks</td></tr>
+<tr><td>SSE</td><td>server → client</td><td>read-only feeds</td></tr>
+<tr><td>WebSocket</td><td>both, any time</td><td>chatty, low-latency, two-way</td></tr>
+</table>
+</section>
+</div>
+
+<p class="lede" style="margin-top:2rem;font-size:.9rem">Source: <a href="https://www.rfc-editor.org/rfc/rfc6455">RFC 6455</a>. Try frames in the decoder in <a href="../lessons/0001-what-a-websocket-really-is.html#quiz1">Lesson 0001</a>.</p>
+</main>
+</body>
+</html>

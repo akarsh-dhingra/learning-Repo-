@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Socket Backend Patterns</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body class="ref">
+<main>
+<nav class="crumbs"><a href="../lessons/index.html">Course map</a> · Reference · lessons 0004–0012</nav>
+<span class="kicker">Reference · build-side cheat sheet</span>
+<h1>Socket backend patterns</h1>
+
+<div class="cols">
+<section>
+<h2>Envelope &amp; errors (0004)</h2>
+<pre>client → { type, id?, data? }
+server → { type:"ack", id, data }
+       | { type:"error", id?, data:{ code, message } }
+       | { type, seq?, data }            // events
+codes: bad_json bad_envelope unknown_type invalid
+       forbidden limit rate_limited internal</pre>
+<p>Bad message → error, keep the socket. Abuse → close 1008. Name types <code>noun.verb</code>. No <code>id</code> on high-frequency traffic.</p>
+
+<h2>Message kinds (0005)</h2>
+<table>
+<tr><th></th><th>Durable</th><th>Ephemeral</th></tr>
+<tr><td>examples</td><td>stroke, chat, order</td><td>cursor, position, typing</td></tr>
+<tr><td>stored / seq</td><td>yes / yes</td><td>no / no</td></tr>
+<tr><td>ack</td><td>yes</td><td>no</td></tr>
+<tr><td>slow client</td><td>never skip → kick</td><td>coalesce, skip</td></tr>
+</table>
+
+<h2>Upgrade checklist (0005–0006)</h2>
+<pre>1 Origin in allowlist?        else 403
+2 token valid, not expired?   else 401   (identity = token.sub)
+3 params valid (room id)?     else 400
+4 capacity ok?                else 503
+5 draining?                   else 503
+6 server.upgrade(req, { data })</pre>
+
+<h2>Join order</h2>
+<pre>single node:  snapshot → subscribe          (open is sync)
+multi node:   subscribe → snapshot          (client buffers seq'd events
+                                             until snapshot, drops seq ≤ snap.seq)</pre>
+
+<h2>Resume (0006)</h2>
+<pre>reconnect ?lastSeq=N&amp;epoch=E
+resume if  E == room.epoch  &amp;&amp;  oldestLogSeq−1 ≤ N ≤ room.seq
+else       full room.state
+client:    apply only seq &gt; lastSeq (dedupe)</pre>
+
+<h2>Client reconnect</h2>
+<pre>delay = random(0, min(10s, 0.5s × 2^attempt))   // full jitter
+reset attempt on open · 4001 → refresh token, retry now
+app-level ping every 10s, 5s timeout → close → reconnect</pre>
+</section>
+
+<section>
+<h2>Backpressure (0007)</h2>
+<pre>ws.getBufferedAmount()  (Bun)   ws.bufferedAmount (ws/browser)
+SOFT 64 KB  → skip ephemeral for that socket
+HARD 1 MB   → ws.terminate()  (not close: frame queues behind backlog)
+backpressureLimit &gt; HARD      (past it Bun DROPS silently)
+cursors: coalesce per user, flush one batch per room per tick</pre>
+
+<h2>Scaling (0008, 0010)</h2>
+<table>
+<tr><th></th><th>Pattern A: backplane</th><th>Pattern B: owners</th></tr>
+<tr><td>routing</td><td>any node</td><td>hash(room) → owner</td></tr>
+<tr><td>order</td><td>Lua: INCR + store + PUBLISH</td><td>owner's memory</td></tr>
+<tr><td>fits</td><td>chat, CEX market data</td><td>worlds, docs, matches</td></tr>
+<tr><td>breaks at</td><td>backplane: nodes × rooms</td><td>hot rooms, failover</td></tr>
+</table>
+<pre>rule (A): fan out ONLY what you receive from Redis
+membership: SET node:id url EX 5, refresh every 1.5s
+owner = argmax_node hash(room|node)    // rendezvous
+not owner → 421 · moved → close 4010 · full → 503
+presence: ZADD presence:{room} now member; read score &gt; now−15s</pre>
+
+<h2>Order books (0011)</h2>
+<pre>subscribe diffs → buffer → GET snapshot
+snapshot.id &lt; firstU−1 → refetch
+drop buffered u ≤ id → apply rest → live
+live: U &gt; id+1 → GAP → resync · qty "0" → delete level
+rate limit: token bucket per socket, close 1008</pre>
+
+<h2>Operating (0012)</h2>
+<pre>/metrics: connections, msgs in/out, kicked, drops,
+          max buffered, loop lag, RSS
+drain: healthz 503 → refuse upgrades 503 →
+       close 1001 spread over DRAIN_MS → exit
+Redis pubsub client limit: 32 MB hard, 8 MB / 60s soft
+debug order: loop lag → send buffers → load gen → Redis omem</pre>
+
+<h2>Measured on your M4</h2>
+<table>
+<tr><th>What</th><th>Result</th></tr>
+<tr><td>Bun vs Node+ws broadcast</td><td>~2.0M vs ~225k msgs/s</td></tr>
+<tr><td>300 bots, interest off/on</td><td>21.0 vs 2.0 MB/s</td></tr>
+<tr><td>3k sockets, 3 nodes</td><td>stroke p50 15 ms</td></tr>
+<tr><td>5k, round-robin / affinity</td><td>p50 6.8 s / 43 ms</td></tr>
+</table>
+</section>
+</div>
+<p class="lede" style="margin-top:2rem;font-size:.9rem">Sources: <a href="https://bun.com/docs/runtime/http/websockets">Bun WebSockets</a> · <a href="https://redis.io/docs/latest/develop/pubsub/">Redis Pub/Sub</a> · <a href="https://redis.io/docs/latest/develop/reference/clients/">Redis client limits</a> · <a href="https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md">Binance streams</a> · <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">AWS backoff</a>.</p>
+</main>
+</body>
+</html>

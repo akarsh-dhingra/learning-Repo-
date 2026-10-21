@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Locks and Limits Reference</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="../lessons/index.html">Course map</a> · Reference · used by <a href="../lessons/0008-rate-limiting.html">0008</a>, <a href="../lessons/0009-distributed-locks-done-right.html">0009</a>, <a href="../lessons/0010-leases-fencing-and-redlock.html">0010</a>, <a href="../assignments/A1-seat-hold-lock/brief.html">A1</a></nav>
+<span class="kicker">Cheat sheet</span>
+<h1>Locks &amp; rate limits</h1>
+<p class="lede">Every script you need, each one atomic.</p>
+
+<h2>Rate limiting</h2>
+<h3>Fixed window (INCR + TTL on first hit)</h3>
+<pre>local n = redis.call("INCR", KEYS[1])
+if n == 1 then redis.call("PEXPIRE", KEYS[1], ARGV[1]) end
+return { n, redis.call("PTTL", KEYS[1]) }</pre>
+<p>Leak: up to 2× the limit across a window boundary.</p>
+<h3>Sliding window log (sorted set)</h3>
+<pre>ZREMRANGEBYSCORE k -inf (now - window)
+if ZCARD k &lt; limit: ZADD k now &lt;unique&gt;; PEXPIRE k window; allow
+else: reject, retry after (oldest score + window - now)</pre>
+<p>No boundary burst. Memory = one entry per request in the window.</p>
+
+<h2>Locks</h2>
+<div class="table-wrap"><table>
+  <tr><th>Step</th><th>How</th><th>Prevents</th></tr>
+  <tr><td>Acquire</td><td><code>SET lock:{r} &lt;token&gt; NX PX ttl</code>, plus <code>INCR fence:{r}</code> in the same script</td><td>Two holders; locks that never expire; stale holders getting newer fences</td></tr>
+  <tr><td>Release</td><td>Compare-and-delete script (or <code>DELEX k IFEQ token</code> on 8.4+)</td><td>Deleting someone else's lock</td></tr>
+  <tr><td>Extend</td><td>Compare-and-<code>PEXPIRE</code> script</td><td>Extending a lock you've lost</td></tr>
+  <tr><td>Retry</td><td>Random delay, then try again</td><td>Clients retrying in lock-step and colliding</td></tr>
+  <tr><td>Use</td><td><code>try { … } finally { release }</code></td><td>Locks leaked on exceptions</td></tr>
+  <tr><td>Write</td><td>Storage rejects <code>fence &lt; lastFence</code></td><td>Paused clients; two holders after failover</td></tr>
+</table></div>
+
+<pre><span class="c">-- acquire (KEYS: lock, fence · ARGV: token, ttlMs) → fence or 0</span>
+if redis.call("set", KEYS[1], ARGV[1], "NX", "PX", ARGV[2]) then
+  return redis.call("incr", KEYS[2])
+end
+return 0
+
+<span class="c">-- release (KEYS: lock · ARGV: token) → 1 or 0</span>
+if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) end
+return 0
+
+<span class="c">-- extend (KEYS: lock · ARGV: token, ttlMs) → 1 or 0</span>
+if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("pexpire", KEYS[1], ARGV[2]) end
+return 0</pre>
+
+<h3>Fenced write in Postgres</h3>
+<pre>UPDATE seats SET holder = $1, fence = $2 WHERE id = $3 AND fence &lt; $2;   <span class="c">-- 0 rows ⇒ fenced off</span></pre>
+
+<h2>Redlock (N = 5)</h2>
+<p>Lock all nodes in parallel with short timeouts. You hold it if you got ≥ 3 nodes <em>and</em> the elapsed time is under the TTL. Validity = TTL − elapsed − drift. If you failed, unlock everywhere. Safety depends on timing assumptions, so use fencing for correctness.</p>
+
+<h2>Which lock?</h2>
+<ul>
+  <li><strong>Efficiency</strong> (duplicate work is just wasteful): single Redis instance.</li>
+  <li><strong>Correctness</strong>, and the data is in one DB: DB constraint / <code>FOR UPDATE</code> / conditional update.</li>
+  <li><strong>Correctness</strong> across services: lease (Redis or etcd) <em>plus</em> a fenced write.</li>
+</ul>
+<p>Sources: <a href="https://redis.io/docs/latest/commands/incr/">INCR patterns</a> · <a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">Distributed locks</a> · <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Kleppmann</a></p>
+</main>
+</body>
+</html>

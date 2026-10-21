@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini Exchange</title>
+<style>
+  :root { --bg: #f8f7f4; --fg: #1d1c1a; --muted: #6b6760; --rule: #e4e0d8; --card: #fff; --buy: #2f7d4f; --sell: #b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161514; --fg: #ecebe7; --muted: #a29d94; --rule: #34322e; --card: #1d1c1a; --buy: #6fcf97; --sell: #f08a80; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  header { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; padding: .6rem 16px; border-bottom: 1px solid var(--rule); }
+  header .muted, .muted { color: var(--muted); }
+  main { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; padding: 16px; }
+  section { background: var(--card); border: 1px solid var(--rule); border-radius: 8px; padding: .7rem .9rem; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 .5rem; }
+  table { width: 100%; border-collapse: collapse; font: 13px/1.5 ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  td { padding: 0 .3rem; text-align: right; }
+  .ask td:first-child { color: var(--sell); } .bid td:first-child { color: var(--buy); }
+  .spread td { color: var(--muted); text-align: center; border-block: 1px solid var(--rule); }
+  .buy { color: var(--buy); } .sell { color: var(--sell); }
+  #tape { max-height: 420px; overflow: hidden; }
+  button, select, input { font: inherit; padding: .3rem .6rem; border: 1px solid var(--rule); background: var(--card); color: var(--fg); border-radius: 6px; }
+  label { display: inline-flex; gap: .3rem; align-items: center; }
+  #events p { margin: .2rem 0; font: 12px ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <b>Mini Exchange</b>
+  <select id="sym"><option>BTC-USD</option><option>ETH-USD</option></select>
+  <span id="sync" class="muted">connecting…</span>
+  <label title="Drops 5% of depth diffs before they reach the book, to prove gap detection works"><input type="checkbox" id="lossy"> simulate packet loss</label>
+</header>
+<main>
+  <section><h2>Order book</h2><table id="book"></table></section>
+  <section><h2>Trades</h2><table id="tape"></table></section>
+  <section>
+    <h2>Trade (private stream)</h2>
+    <p class="muted" id="who">logging in…</p>
+    <p><button id="buy" class="buy">Buy 0.01 at best ask</button> <button id="sell" class="sell">Sell 0.01 at best bid</button></p>
+    <div id="events"></div>
+  </section>
+</main>
+<script type="module">
+  import { createClient } from "./client.js";
+  import { LocalBook } from "./orderbook.js";
+
+  const { token } = await (await fetch("/login", { method: "POST", body: JSON.stringify({ name: "you" }) })).json();
+  const client = createClient(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/?token=${token}`);
+  let symbol = "BTC-USD", book = null;
+  const $ = (id) => document.getElementById(id);
+
+  function render(b) {
+    const { bids, asks } = b.top(10);
+    const row = (cls) => ([p, q]) => `<tr class="${cls}"><td>${p}</td><td>${q}</td></tr>`;
+    const spread = asks[0] && bids[0] ? (asks[0][0] - bids[0][0]).toFixed(2) : "–";
+    $("book").innerHTML = asks.slice().reverse().map(row("ask")).join("") + `<tr class="spread"><td colspan="2">spread ${spread}</td></tr>` + bids.map(row("bid")).join("");
+    $("sync").textContent = `${b.synced ? "in sync" : "resyncing…"} · update ${b.lastUpdateId} · gaps detected ${b.stats.gaps} · syncs ${b.stats.syncs}`;
+  }
+
+  async function watch(sym) {
+    if (book) await client.request("unsubscribe", { streams: [`${symbol}@depth`, `${symbol}@trade`] });
+    symbol = sym;
+    $("tape").innerHTML = "";
+    book = new LocalBook({ fetchSnapshot: () => fetch(`/depth?symbol=${sym}`).then((r) => r.json()), onChange: render });
+    await client.request("subscribe", { streams: [`${sym}@depth`, `${sym}@trade`] }); // 1. start receiving diffs
+    book.sync();                                                                         // 2. then get the snapshot
+  }
+
+  client.on("welcome", (d) => { $("who").textContent = d.authenticated ? `logged in · gateway ${d.node}` : "anonymous"; watch(symbol); });
+  client.on("depth", (diff) => {
+    if (diff.s !== symbol) return;
+    if ($("lossy").checked && Math.random() < 0.05) return; // pretend the network ate it
+    book.onDiff(diff);
+  });
+  client.on("trade", (t) => {
+    if (t.s !== symbol) return;
+    $("tape").insertAdjacentHTML("afterbegin", `<tr><td class="${t.side}">${t.p}</td><td>${t.q}</td><td class="muted">${new Date(t.t).toLocaleTimeString()}</td></tr>`);
+    while ($("tape").rows.length > 25) $("tape").deleteRow(-1);
+  });
+  const log = (txt) => $("events").insertAdjacentHTML("afterbegin", `<p>${txt}</p>`);
+  client.on("order.accepted", (o) => log(`accepted #${o.orderId} ${o.side} ${o.qty} @ ${o.price}`));
+  client.on("order.filled", (o) => log(`<b>filled</b> #${o.orderId} ${o.side} ${o.filledQty} @ ${o.price}`));
+
+  async function place(side) {
+    const { bids, asks } = book.top(1);
+    const price = side === "buy" ? asks[0][0] : bids[0][0];
+    try { await client.request("order.place", { clientOrderId: crypto.randomUUID(), symbol, side, price, qty: "0.01" }); }
+    catch (e) { log(`rejected: ${e.message}`); }
+  }
+  $("buy").onclick = () => place("buy");
+  $("sell").onclick = () => place("sell");
+  $("sym").onchange = (e) => watch(e.target.value);
+</script>
+</body>
+</html>

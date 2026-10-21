@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebSockets Course Map</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<span class="kicker">Course map</span>
+<h1>The real-time socket layer</h1>
+<p class="lede">From the bytes on the wire to a socket layer that can carry Excalidraw, Gather Town, a crypto exchange or a multiplayer game.</p>
+
+<p>Part I starts with the protocol (0001–0003), then switches to <strong>building</strong>: from 0004 on, every lesson is a build-along with a reference solution in <code>labs/</code> and an automated check suite you run against <em>your own</em> server in <code>~/learning-websockets/build/</code>. Tick lessons off as you finish them.</p>
+<pre>URL=http://localhost:8080 bun test ~/learning-websockets/labs/NNNN-…/check.test.ts   <span class="c"># red → fix → green</span></pre>
+
+<h2>Part I · Foundations, then build one server</h2>
+<ul class="map">
+  <li><input type="checkbox" data-id="0001" aria-label="done"><span><a href="0001-what-a-websocket-really-is.html">0001 · What a WebSocket really is</a><span class="sub">Polling vs SSE vs WS · handshake · frames · masking · ping/pong · close codes · zero-library server lab</span></span><span class="t">30 min</span></li>
+  <li><input type="checkbox" data-id="0002" aria-label="done"><span><a href="0002-node-vs-bun-measured.html">0002 · Node vs Bun, measured</a><span class="sub">Same chat server twice · benchmark on your M4 (Bun ≈7–10×) · why · the Bun API</span></span><span class="t">35 min</span></li>
+  <li><input type="checkbox" data-id="0003" aria-label="done"><span><a href="0003-the-socket-layer-in-production.html">0003 · The socket layer in production: the map</a><span class="sub">Stateful connections · gateway / backplane / owner · Pattern A vs B · fan-out math · Slack, Figma, Discord</span></span><span class="t">35 min</span></li>
+  <li><input type="checkbox" data-id="0004" aria-label="done"><span><a href="0004-message-protocol.html">0004 · Design the message protocol</a><span class="sub">Envelope, typed router, Zod validation, acks &amp; errors by id · chat lobby · 10 checks</span></span><span class="t">40 min</span></li>
+  <li><input type="checkbox" data-id="0005" aria-label="done"><span><a href="0005-whiteboard-rooms.html">0005 · Build an Excalidraw-style room server</a><span class="sub">Rooms, snapshot on join, durable strokes vs ephemeral cursors, canvas client · 10 checks</span></span><span class="t">60 min</span></li>
+  <li><input type="checkbox" data-id="0006" aria-label="done"><span><a href="0006-auth-heartbeat-resume.html">0006 · Auth, heartbeats, reconnect &amp; resume</a><span class="sub">Token + Origin at upgrade, expiry, multi-tab presence, seq + replay log + epoch, jittered backoff · 10 checks</span></span><span class="t">75 min</span></li>
+  <li><input type="checkbox" data-id="0007" aria-label="done"><span><a href="0007-backpressure.html">0007 · Backpressure &amp; slow consumers</a><span class="sub">Cursor batching on a tick, skip-when-slow, terminate at 1 MB, a real stuck client · 3 checks</span></span><span class="t">50 min</span></li>
+</ul>
+
+<h2>Part II · Scaling and system design</h2>
+<ul class="map">
+  <li><input type="checkbox" data-id="0008" aria-label="done"><span><a href="0008-redis-backplane.html">0008 · Many nodes, one room: the Redis backplane</a><span class="sub">State + seq + presence in Redis, atomic Lua emit, 3-node cluster, resume on another node · 7 checks</span></span><span class="t">90 min</span></li>
+  <li><input type="checkbox" data-id="0009" aria-label="done"><span><a href="0009-world-interest-management.html">0009 · A Gather-style world: ticks &amp; interest management</a><span class="sub">Authoritative movement, 10 Hz tick, spatial grid, enter/moves/leave deltas, proximity chat, bot swarm · 7 checks</span></span><span class="t">75 min</span></li>
+  <li><input type="checkbox" data-id="0010" aria-label="done"><span><a href="0010-space-ownership.html">0010 · Space ownership, presence &amp; failover</a><span class="sub">Pattern B: TTL heartbeats, rendezvous hashing, directory, 421/4010, crash → failover · 6 checks</span></span><span class="t">75 min</span></li>
+  <li><input type="checkbox" data-id="0011" aria-label="done"><span><a href="0011-orderbook-feed.html">0011 · A CEX market-data gateway with gap-free order books</a><span class="sub">Streams, snapshot + diffs, gap detection &amp; resync, private order streams, rate limits · 8 + 5 checks</span></span><span class="t">90 min</span></li>
+  <li><input type="checkbox" data-id="0012" aria-label="done"><span><a href="0012-operating-it.html">0012 · Operating it: metrics, drains, load tests</a><span class="sub">Prometheus metrics, graceful drain, load test to failure, debugging the backplane, room affinity · 2 checks</span></span><span class="t">90 min</span></li>
+  <li class="special"><input type="checkbox" data-id="cap" aria-label="done"><span><a href="capstone.html"><strong>Capstone · Build the socket layer for one mission app</strong></a><span class="sub">Excalidraw, Gather Town, CEX or a game: design doc + multi-node build + your own tests + a load test</span></span><span class="t">4–6 h</span></li>
+</ul>
+
+<h2>Reference sheets</h2>
+<ul>
+  <li><a href="../reference/protocol.html">Protocol cheat sheet</a>: handshake, frame layout, opcodes, masking, close codes</li>
+  <li><a href="../reference/server-api.html">Server API</a>: Bun vs Node + ws side by side, client API, your benchmark numbers</li>
+  <li><a href="../reference/backend-patterns.html">Backend patterns</a>: envelope, upgrade checklist, resume, backpressure, Pattern A/B, order books, operating, measured numbers</li>
+</ul>
+
+<h2>Labs on your machine</h2>
+<div class="table-wrap"><table>
+  <tr><th>Lab</th><th>Run</th><th>Ports</th></tr>
+  <tr><td><code>0001-handshake-by-hand</code></td><td><code>node server.mjs</code> · <code>node client.mjs</code></td><td>8081</td></tr>
+  <tr><td><code>0002-node-vs-bun</code></td><td><code>./run-bench.sh</code></td><td>8080</td></tr>
+  <tr><td><code>0004</code>–<code>0007</code></td><td><code>bun server.ts</code> · <code>bun test check.test.ts</code></td><td>8080</td></tr>
+  <tr><td><code>0008-redis-backplane</code>, <code>0012-operating-it</code></td><td><code>./start-cluster.sh</code> · <code>./stop-cluster.sh [--all]</code></td><td>8081–8083, Redis 6390</td></tr>
+  <tr><td><code>0009-world-interest</code></td><td><code>bun server.ts</code> · <code>bun bots.ts 300</code></td><td>8090</td></tr>
+  <tr><td><code>0010-space-ownership</code></td><td><code>./start-cluster.sh</code> (restart one: <code>./start-cluster.sh node-2</code>)</td><td>9000–9003, Redis 6390</td></tr>
+  <tr><td><code>0011-orderbook-feed</code></td><td><code>./start.sh</code> · <code>./stop.sh</code></td><td>7001–7002, Redis 6390</td></tr>
+</table></div>
+<p>Redis runs natively (<code>redis-server --port 6390</code>, started by the scripts), so Docker isn't needed. Shared test helper: <code>labs/_shared/test-client.ts</code>.</p>
+
+<div class="ask"><h3>Your teacher is in the terminal</h3><p>Ask anything, paste assignment work for review, or say “quiz me on 0004–0008” for a mixed review session. Spaced review works best: come back to the recall prompts in a few days, not just right after reading.</p></div>
+</main>
+<script>
+  // Per-viewer progress ticks; safe to lose.
+  document.querySelectorAll(".map input[type=checkbox]").forEach((box) => {
+    const k = "ws-course:" + box.dataset.id;
+    try { box.checked = localStorage.getItem(k) === "1"; } catch (e) {}
+    box.addEventListener("change", () => { try { localStorage.setItem(k, box.checked ? "1" : "0"); } catch (e) {} });
+  });
+</script>
+</body>
+</html>

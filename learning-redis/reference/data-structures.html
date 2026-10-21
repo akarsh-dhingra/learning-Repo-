@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis Data Structures Reference</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="../lessons/index.html">Course map</a> · Reference · used by <a href="../lessons/0003-data-structures-toolkit.html">Lesson 0003</a></nav>
+<span class="kicker">Cheat sheet</span>
+<h1>Data structures</h1>
+<p class="lede">Pick the type whose built-in operations already do your job.</p>
+
+<div class="table-wrap"><table>
+  <tr><th>Need</th><th>Type</th><th>Commands</th></tr>
+  <tr><td>Cache an object you always read whole</td><td>String (JSON)</td><td><code>SET k v EX n</code> · <code>GET</code></td></tr>
+  <tr><td>Atomic counter</td><td>String</td><td><code>INCR</code> · <code>INCRBY</code> · <code>DECR</code></td></tr>
+  <tr><td>Set-if-absent / simple lock</td><td>String</td><td><code>SET k v NX PX ms</code></td></tr>
+  <tr><td>Object you update field by field</td><td>Hash</td><td><code>HSET</code> · <code>HGET</code> · <code>HGETALL</code> · <code>HINCRBY</code></td></tr>
+  <tr><td>Queue (FIFO)</td><td>List</td><td><code>LPUSH</code> + <code>RPOP</code></td></tr>
+  <tr><td>Stack (LIFO)</td><td>List</td><td><code>LPUSH</code> + <code>LPOP</code></td></tr>
+  <tr><td>Latest N items</td><td>List</td><td><code>LPUSH</code> then <code>LTRIM k 0 N-1</code></td></tr>
+  <tr><td>Unique members, membership test</td><td>Set</td><td><code>SADD</code> (returns 0 if already present) · <code>SISMEMBER</code> · <code>SCARD</code> · <code>SINTER</code></td></tr>
+  <tr><td>Leaderboard / ranking</td><td>Sorted set</td><td><code>ZINCRBY</code> · <code>ZRANGE k 0 9 REV WITHSCORES</code></td></tr>
+  <tr><td>Sliding time window</td><td>Sorted set (score = time)</td><td><code>ZADD</code> · <code>ZREMRANGEBYSCORE</code> · <code>ZCARD</code></td></tr>
+  <tr><td>Nearby search</td><td>Geo</td><td><code>GEOADD k lon lat m</code> (longitude first!) · <code>GEOSEARCH k FROMLONLAT lon lat BYRADIUS 5 km WITHDIST</code></td></tr>
+  <tr><td>Fire-and-forget notifications</td><td>Pub/Sub</td><td><code>PUBLISH</code> · <code>SUBSCRIBE</code>. At-most-once, nothing is stored</td></tr>
+  <tr><td>Durable event log / job queue</td><td>Stream</td><td><code>XADD</code> · <code>XREADGROUP</code> · <code>XACK</code>. Messages are kept, at-least-once possible</td></tr>
+</table></div>
+
+<h2>Gotchas</h2>
+<ul>
+  <li>A string value can be up to 512 MB.</li>
+  <li><code>SET</code> on an existing key replaces the value <strong>and clears its TTL</strong>.</li>
+  <li><code>SISMEMBER</code> then <code>SADD</code> is a check-then-act race. Use <code>SADD</code>'s return value instead.</li>
+  <li>Pub/Sub messages sent while a subscriber is disconnected are lost. <a href="https://redis.io/docs/latest/develop/pubsub/">Source</a></li>
+</ul>
+<p>Sources: <a href="https://redis.io/docs/latest/develop/data-types/">Redis data types</a> · <a href="https://redis.io/docs/latest/develop/data-types/compare-data-types/">Compare data types</a></p>
+</main>
+</body>
+</html>

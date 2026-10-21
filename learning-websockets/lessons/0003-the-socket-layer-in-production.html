@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Socket Layer in Production</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="../reference/protocol.html">Reference: protocol</a> · <a href="../reference/server-api.html">Reference: server API</a> · Lesson 3</nav>
+
+<span class="kicker">Lesson 0003 · System design · ~35 min</span>
+<h1>The socket layer in production: the whole map</h1>
+<p class="lede">HTTP servers are interchangeable. WebSocket servers aren't. Every hard part of scaling real-time systems comes from that one fact.</p>
+
+<div class="win"><strong>Your win for this lesson:</strong> you can draw a production socket layer from memory, choose between the two scaling patterns for a given app (Excalidraw, Gather Town, CEX, game), and do the fan-out math that decides how many servers you need.</div>
+
+<h2>1. Why connections change everything</h2>
+<p>A REST request can land on any server, because the request carries everything it needs. A WebSocket is a <strong>long-lived, stateful</strong> connection: once user A's socket is open to gateway #2, <em>only gateway #2 can write to it</em>. Four consequences follow, and the rest of this course is about them:</p>
+<ol class="steps">
+  <li><strong>Cross-node broadcast.</strong> Alice is on node 1 and Bob is on node 2, in the same Excalidraw room. Node 1 can't write to Bob's socket. This is exactly what breaks when you run two copies of the assignment A2 <code>rooms.ts</code>.</li>
+  <li><strong>Load is measured in connections, not requests.</strong> A node with 50k idle sockets is busy even with zero traffic: each holds memory, a file descriptor and heartbeat timers.</li>
+  <li><strong>Deploys drop users.</strong> Restarting a node closes every socket on it (code 1001). Thousands of clients reconnect at once, which is called a <strong>reconnect storm</strong>.</li>
+  <li><strong>Messages can be lost in the gap.</strong> Anything sent while a client was reconnecting is gone unless you design for resume, using sequence numbers.</li>
+</ol>
+
+<h2>2. The reference architecture</h2>
+<figure>
+<svg viewBox="0 0 640 300" role="img" aria-label="Clients connect through an edge load balancer to several gateway nodes. Gateways subscribe to a pub/sub backplane. App services publish events to the backplane and store state in a database.">
+  <rect class="box" x="10" y="20" width="90" height="34" rx="6"/><text x="55" y="42" text-anchor="middle" font-size="12">browser</text>
+  <rect class="box" x="10" y="70" width="90" height="34" rx="6"/><text x="55" y="92" text-anchor="middle" font-size="12">mobile</text>
+  <rect class="box" x="10" y="120" width="90" height="34" rx="6"/><text x="55" y="142" text-anchor="middle" font-size="12">game client</text>
+  <rect class="box" x="140" y="55" width="100" height="64" rx="6"/><text x="190" y="82" text-anchor="middle" font-size="12">edge / LB</text><text class="small" x="190" y="100" text-anchor="middle">TLS · wss://</text>
+  <rect class="hot" x="285" y="10" width="120" height="40" rx="6"/><text x="345" y="35" text-anchor="middle" font-size="12">gateway 1</text>
+  <rect class="hot" x="285" y="67" width="120" height="40" rx="6"/><text x="345" y="92" text-anchor="middle" font-size="12">gateway 2</text>
+  <rect class="hot" x="285" y="124" width="120" height="40" rx="6"/><text x="345" y="149" text-anchor="middle" font-size="12">gateway N</text>
+  <rect class="box" x="455" y="55" width="175" height="64" rx="6"/><text x="542" y="80" text-anchor="middle" font-size="12">pub/sub backplane</text><text class="small" x="542" y="100" text-anchor="middle">Redis · NATS · Kafka</text>
+  <rect class="box" x="455" y="200" width="175" height="44" rx="6"/><text x="542" y="227" text-anchor="middle" font-size="12">app services + DB</text>
+  <rect class="box" x="285" y="220" width="120" height="44" rx="6"/><text x="345" y="240" text-anchor="middle" font-size="12">presence</text><text class="small" x="345" y="256" text-anchor="middle">who is online</text>
+  <path class="line" d="M100 37 L140 75 M100 87 L140 87 M100 137 L140 100"/>
+  <path class="line" d="M240 75 L285 30 M240 87 L285 87 M240 100 L285 144"/>
+  <path class="line" d="M405 30 L455 75 M405 87 L455 87 M405 144 L455 100"/>
+  <path class="line" d="M542 200 L542 119"/>
+  <path class="line" d="M345 164 L345 220"/>
+  <text class="small" x="550" y="165">publish events</text>
+  <text class="small" x="410" y="186">subscribe per room</text>
+  <text class="small" x="10" y="290">gateways: sockets, auth, heartbeats, local fan-out. No business logic.</text>
+</svg>
+<figcaption>The shape you'll see at Slack, Discord and most real-time products. The names change; the roles don't.</figcaption>
+</figure>
+<div class="table-wrap"><table>
+  <tr><th>Box</th><th>Job</th><th>At Slack<sup class="cite"><a href="https://slack.engineering/real-time-messaging/">[1]</a></sup></th></tr>
+  <tr><td>Edge / LB</td><td>TLS termination, spreads <em>new</em> connections across gateways</td><td>Envoy</td></tr>
+  <tr><td>Gateway</td><td>Holds the sockets. Knows which local sockets are in which room. Nothing else.</td><td>Gateway Servers, run in multiple regions</td></tr>
+  <tr><td>Backplane / room owner</td><td>Gets a message to every gateway that has members of that room</td><td>Channel Servers, each owning channels by <strong>consistent hashing</strong></td></tr>
+  <tr><td>Presence</td><td>Who's online and where</td><td>Presence Servers</td></tr>
+  <tr><td>App services</td><td>Validation, persistence, business rules</td><td>Webapp API → Admin Servers</td></tr>
+</table></div>
+<p>Slack's message path: the sender calls the API → the API hashes the channel ID to find its Channel Server → that server forwards to every Gateway subscribed to the channel → each Gateway writes to its local sockets. Delivery is worldwide in about 500 ms<sup class="cite"><a href="https://slack.engineering/real-time-messaging/">[1]</a></sup>.</p>
+
+<h2>3. Two scaling patterns</h2>
+<h3>Pattern A: any node + backplane</h3>
+<p>The load balancer puts each connection on any gateway. When a message arrives for room <code>r</code>, the gateway <strong>publishes it once to the backplane</strong>. Every gateway that has local members of <code>r</code> has subscribed to that channel. Each one receives the message and fans it out to its own sockets. Socket.IO calls this component an <em>adapter</em>, with Redis, Postgres and others as options<sup class="cite"><a href="https://socket.io/docs/v4/using-multiple-nodes/">[2]</a></sup>.</p>
+<ul>
+  <li><strong>Good for:</strong> chat, notifications, and CEX market data. One publisher (the matching engine) feeds many readers spread across many gateways.</li>
+  <li><strong>Watch out:</strong> Redis Pub/Sub is <em>at-most-once</em>. “If the subscriber is unable to handle the message (for example, due to an error or a network disconnect) the message is forever lost”<sup class="cite"><a href="https://redis.io/docs/latest/develop/pubsub/#delivery-semantics">[3]</a></sup>. You need sequence numbers and a catch-up path, or Redis Streams. In Redis Cluster, use <em>sharded</em> Pub/Sub (<code>SPUBLISH</code>), so messages don't flood every node<sup class="cite"><a href="https://redis.io/docs/latest/develop/pubsub/#sharded-pubsub">[3]</a></sup>. Your Redis course's hash-slot knowledge applies directly here.</li>
+</ul>
+<h3>Pattern B: room ownership (sharding by room)</h3>
+<p>Every room has exactly <strong>one owner process</strong>, picked by consistent hashing on the room ID. All of that room's traffic goes through its owner. Figma: “our servers currently spin up a separate process for each multiplayer document”, and “the server is the ultimate authority on what the document looks like”<sup class="cite"><a href="https://www.figma.com/blog/how-figmas-multiplayer-technology-works/">[4]</a></sup>. Discord does the same with a process per guild that fans out to session processes<sup class="cite"><a href="https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users">[5]</a></sup>.</p>
+<ul>
+  <li><strong>Good for:</strong> anything that needs <em>one authoritative state and one order of events</em>: Excalidraw/Figma documents, a Gather Town map's positions, a game world's simulation tick. One owner means a total order for free, so last-writer-wins becomes well defined.</li>
+  <li><strong>Watch out:</strong> hot rooms. A 100k-member Discord server or a viral stream lands entirely on one owner. Owner failure needs a fast handover. Slack's replacements are ready in under 20 seconds<sup class="cite"><a href="https://slack.engineering/real-time-messaging/">[1]</a></sup>.</li>
+</ul>
+
+<div class="correction">
+  <div><span class="label">Common belief</span>“To scale WebSockets you need sticky sessions on the load balancer.”</div>
+  <div><span class="label">More precisely</span>A WebSocket is one TCP connection, so it already stays on one server. Sticky sessions matter for <em>long-polling fallbacks</em>, where many separate HTTP requests must reach the same process<sup class="cite"><a href="https://socket.io/docs/v4/using-multiple-nodes/">[2]</a></sup>. What you might want instead is <em>room affinity</em> (Pattern B), which is a routing decision based on the room, not the client.</div>
+</div>
+
+<h2>4. Fan-out math: the number that sizes everything</h2>
+<p>In a room where everyone sees everyone, each inbound message becomes N outbound messages. So <strong>outbound grows with N²</strong>. Drag the sliders. Start with an Excalidraw room of 10 people sending 20 cursor updates per second. Then try a Gather Town space with 300 people moving at 10 updates/sec, first with everyone visible (100%), then with each person only seeing nearby avatars (5%).</p>
+<div class="fanout" data-users="300" data-rate="10" data-bytes="60" data-visible="100"></div>
+<p>At 300 users and 100% visibility, that's 900k msgs/s out of one room. That's half of your measured single-process Bun ceiling, for a single space. At 5% visibility, it drops to 45k. This trick is called <strong>interest management</strong>: only send each client what's near them. It's the single biggest lever for Gather Town and metaverse games, and it's why those apps shard by <em>area</em>, not just by room. Other levers, covered in later lessons:</p>
+<ul>
+  <li><strong>Batch per tick</strong>: send one message every 50–100 ms with all changes, instead of one per change. Games call this the tick rate.</li>
+  <li><strong>Deltas, not snapshots</strong>: send only what changed, plus a full snapshot when a client joins or falls behind. That's exactly how CEX order-book feeds work.</li>
+  <li><strong>Serialise once</strong>: build the frame once per room message, not once per recipient. Bun's <code>publish</code> does this for you.</li>
+  <li><strong>Drop, don't queue</strong>: for cursors and positions, only the latest value matters. A slow client should skip stale updates, not buffer them.</li>
+</ul>
+
+<h2>5. Matching the patterns to your mission</h2>
+<div class="table-wrap"><table>
+  <tr><th>App</th><th>Traffic shape</th><th>Natural pattern</th><th>Hardest problem</th></tr>
+  <tr><td>Excalidraw</td><td>Small rooms (2–20), chatty, everyone sees everything</td><td>B: room owner, or A for simple relaying</td><td>Ordering and conflicts on the same element</td></tr>
+  <tr><td>Gather Town</td><td>Medium/large spaces, position updates, proximity</td><td>B, sharded by space/area</td><td>N² fan-out → interest management</td></tr>
+  <tr><td>CEX</td><td>Few publishers (matching engine), huge read fan-out per symbol; plus private order updates per user</td><td>A, with a backplane keyed by symbol and by user</td><td>Gap-free, ordered order-book deltas (sequence numbers)</td></tr>
+  <tr><td>Multiplayer game</td><td>Authoritative server tick (20–60 Hz), inputs up, state down</td><td>B: one simulation owner per match/zone</td><td>Latency, tick budget, cheating (never trust client state)</td></tr>
+</table></div>
+
+<h2>6. Recall first, then check</h2>
+<details class="recall"><summary>Draw the reference architecture from memory and name each box's single job.</summary>
+Edge/LB (TLS, spreads connections) → gateways (hold sockets, auth, local fan-out) → backplane or room owners (cross-node delivery) ↔ app services/DB. Presence is on the side.</details>
+<details class="recall"><summary>Pattern A vs Pattern B in one sentence each.</summary>
+A: any gateway holds any socket, and a pub/sub backplane gets each room's messages to every gateway with members. B: each room has one owner process, chosen by consistent hashing, which orders and fans out all its traffic.</details>
+<details class="recall"><summary>Why does fan-out grow with N², and name three ways to cut it.</summary>
+N senders × N recipients. Cut it with interest management (send only what's nearby), batching per tick, deltas instead of snapshots, and dropping stale updates.</details>
+
+<section id="quiz3">
+<h3>Check yourself</h3>
+<div class="quiz" data-explain="Only the process holding a socket can write to it. Without a backplane or room ownership, node 1 has no path to Bob's socket on node 2.">
+  <p class="q">Two copies of rooms.ts behind a load balancer. Alice (node 1) messages room abc. Bob (node 2, also in abc)…</p>
+  <div class="opts">
+    <button class="opt">Gets it, since the LB forwards it</button>
+    <button class="opt" data-correct>Never gets it; node 1 can't reach</button>
+    <button class="opt">Gets it twice, once from each node</button>
+    <button class="opt">Gets it only with sticky sessions enabled</button>
+  </div>
+</div>
+<div class="quiz" data-explain="One owner per document gives a single order of edits, which is what last-writer-wins needs. Figma runs one process per document.">
+  <p class="q">A collaborative whiteboard needs one agreed order of edits. Best fit?</p>
+  <div class="opts">
+    <button class="opt">Any node with Redis pub/sub</button>
+    <button class="opt">Sticky sessions per client IP</button>
+    <button class="opt" data-correct>One owner process per document</button>
+    <button class="opt">Clients broadcast to each other</button>
+  </div>
+</div>
+<div class="quiz" data-explain="Redis Pub/Sub is at-most-once: a subscriber that's disconnected when the message is published never gets it. You need sequence numbers and a catch-up path (snapshot or a stream).">
+  <p class="q">A gateway's Redis connection blips for 2 seconds. Messages published then are…</p>
+  <div class="opts">
+    <button class="opt">Buffered by Redis until reconnect</button>
+    <button class="opt">Redelivered by the other gateways</button>
+    <button class="opt">Delayed until the TTL expires</button>
+    <button class="opt" data-correct>Lost forever for that gateway</button>
+  </div>
+</div>
+<div class="quiz" data-explain="200 users × 20 msg/s = 4,000 inbound. Each goes to 200 sockets: 800,000 outbound per second.">
+  <p class="q">200 users, each sends 20 msgs/sec, everyone sees everyone. Outbound msgs/sec?</p>
+  <div class="opts">
+    <button class="opt">4,000 messages per second</button>
+    <button class="opt">40,000 messages per second</button>
+    <button class="opt" data-correct>800,000 messages per second</button>
+    <button class="opt">8,000,000 messages per second</button>
+  </div>
+</div>
+<div class="quiz" data-explain="Market data has a single source (the matching engine) and huge read fan-out spread across many gateways. A backplane keyed by symbol fits naturally.">
+  <p class="q">CEX public trades feed for BTC-USDT, 200k subscribers. Natural pattern?</p>
+  <div class="opts">
+    <button class="opt" data-correct>Any gateway plus a backplane by symbol</button>
+    <button class="opt">One owner process for every single subscriber</button>
+    <button class="opt">Clients poll the matching engine directly, constantly</button>
+    <button class="opt">Sticky sessions keyed by the symbol name</button>
+  </div>
+</div>
+<p class="score" data-for="quiz3"></p>
+</section>
+
+<h2>7. System-design rep</h2>
+<p>Take 5 minutes and sketch on paper: <em>“Design the real-time layer for Excalidraw collaboration. Up to 50 users per room, 1M concurrent users total.”</em> Then compare.</p>
+<details class="recall"><summary>A strong answer covers…</summary>
+<ul>
+  <li><strong>Connections:</strong> <code>wss://</code> through an L4/L7 LB to Bun gateways. Auth with a short-lived token checked in <code>fetch</code> before upgrade. If one gateway holds ~50k sockets, you need about 20+ gateways for 1M, plus headroom.</li>
+  <li><strong>Routing:</strong> Pattern B. Hash the room ID to an owner, which orders the room's updates. Gateways forward to the owner and subscribe to its output. Or start with Pattern A and Redis while rooms are small.</li>
+  <li><strong>Fan-out:</strong> 50 users × 20 cursor msgs/s × 50 recipients = 50k msgs/s per <em>full</em> room. So batch cursors every 50 ms, drop stale ones, and send scene edits as deltas.</li>
+  <li><strong>Reliability:</strong> scene edits carry sequence numbers. On reconnect, the client sends its last seq and gets the missing deltas or a fresh snapshot. Cursors aren't persisted at all.</li>
+  <li><strong>Ops:</strong> heartbeats, drain gateways before deploys (close 1001, client reconnects with jittered backoff), and alerts on connection count and send-queue size.</li>
+</ul></details>
+
+<div class="assignment">
+<h3>Assignment A3: Gather Town on one page</h3>
+<p class="meta">~30 min · paper or Excalidraw · no code</p>
+<ol>
+  <li>Draw the socket layer for a Gather Town-like product: 5,000 spaces, the largest has 500 people, and avatars send 10 position updates/sec.</li>
+  <li>Use the calculator to get outbound msgs/sec for the largest space at 100% and at 5% visibility. Which pattern (A or B) do you pick, and what's your shard key?</li>
+  <li>Name the single failure you'd worry about most, and what users see when it happens.</li>
+</ol>
+<p>Describe or paste a photo path in the terminal and I'll critique it the way a design reviewer would.</p>
+</div>
+
+<div class="source">
+<h3>Primary source</h3>
+<p>Read Slack Engineering's <a href="https://slack.engineering/real-time-messaging/">Real-time Messaging</a> (~12 min). It maps one-to-one onto this lesson's diagram. Then read Figma's <a href="https://www.figma.com/blog/how-figmas-multiplayer-technology-works/">How Figma's multiplayer technology works</a> for Pattern B and the reasoning behind a server-authoritative design.</p>
+</div>
+
+<div class="ask">
+<h3>Stuck on anything?</h3>
+<p>Ask me in the terminal. For example: “how does consistent hashing pick the owner, and what happens when a node joins?”, “Redis Pub/Sub vs Streams vs NATS for the backplane?”, or “how many sockets can one Bun process really hold?”. For wisdom from people running this in production, post your A3 design to <a href="https://www.reddit.com/r/ExperiencedDevs/">r/ExperiencedDevs</a> or <a href="https://www.reddit.com/r/gamedev/">r/gamedev</a>.</p>
+</div>
+
+<footer class="next">
+  <a href="0002-node-vs-bun-measured.html">← Lesson 0002 · Node vs Bun</a>
+  <a href="0004-message-protocol.html">Next: Lesson 0004 · Design the message protocol →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/fanout.js"></script>
+</body>
+</html>

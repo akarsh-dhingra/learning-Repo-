@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis Basics Reference</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="../lessons/index.html">Course map</a> · Reference · used by <a href="../lessons/0001-why-cache-and-what-redis-is.html">Lesson 0001</a>, <a href="../lessons/0002-first-commands-and-cache-aside-in-node.html">Lesson 0002</a></nav>
+<span class="kicker">Cheat sheet</span>
+<h1>Redis basics</h1>
+<p class="lede">Cache-aside, TTL rules, persistence modes, and the Node snippet on one page.</p>
+
+<h2>Cache-aside (lazy loading)</h2>
+<ol class="steps">
+  <li><code>GET key</code> from Redis</li>
+  <li>Hit → return it</li>
+  <li>Miss → query the database</li>
+  <li><code>SET key value EX ttl</code> → return it</li>
+</ol>
+<p>The app fills the cache, not Redis. Data can be stale for up to the TTL; on writes, <code>DEL</code> the key to invalidate it. <a href="https://redis.antirez.com/fundamental/cache-aside.html">Source</a></p>
+
+<h2>Commands so far</h2>
+<div class="table-wrap"><table>
+  <tr><th>Command</th><th>Result</th><th>Note</th></tr>
+  <tr><td><code>SET k v</code></td><td><code>OK</code></td><td>Overwrites the value <strong>and clears any TTL</strong></td></tr>
+  <tr><td><code>SET k v EX 60</code></td><td><code>OK</code></td><td>Value and TTL in one atomic command, which is what you want</td></tr>
+  <tr><td><code>SET k v NX</code></td><td><code>OK</code> / <code>(nil)</code></td><td>Only sets it if the key doesn't exist</td></tr>
+  <tr><td><code>GET k</code></td><td>value / <code>(nil)</code></td><td></td></tr>
+  <tr><td><code>EXPIRE k 60</code></td><td><code>1</code> / <code>0</code></td><td>Adds or refreshes a TTL on an existing key</td></tr>
+  <tr><td><code>TTL k</code></td><td>secs / <code>-1</code> / <code>-2</code></td><td><code>-1</code> no expiry · <code>-2</code> no such key</td></tr>
+  <tr><td><code>INCR k</code></td><td>new int</td><td>Atomic; <strong>keeps</strong> the existing TTL</td></tr>
+  <tr><td><code>DEL k</code></td><td>count</td><td>Removes the key (cache invalidation)</td></tr>
+</table></div>
+<p>TTL survives commands that change a value in place (<code>INCR</code>, <code>LPUSH</code>, <code>HSET</code>). It's cleared by commands that replace the key (<code>SET</code>, <code>DEL</code>, <code>GETSET</code>). <a href="https://redis.io/docs/latest/commands/expire/">Source</a></p>
+
+<h2>Why Redis is fast · what it gives up</h2>
+<div class="table-wrap"><table>
+  <tr><th>Fast because</th><th>Costs</th></tr>
+  <tr><td>Data in RAM<br>Commands run one at a time (no locks)<br>Simple in-memory structures</td><td>Data set limited by RAM<br>Possible data loss on a crash (see below)</td></tr>
+</table></div>
+
+<h2>Persistence</h2>
+<div class="table-wrap"><table>
+  <tr><th>Mode</th><th>How</th><th>Can lose on a crash</th></tr>
+  <tr><td>RDB (default)</td><td>Snapshot every N seconds after M writes</td><td>Minutes of writes</td></tr>
+  <tr><td>AOF, <code>everysec</code> (default fsync)</td><td>Logs every write, flushed to disk each second</td><td>About 1 second</td></tr>
+  <tr><td>AOF, <code>always</code></td><td>Flushes to disk on every write</td><td>Almost nothing, but very slow</td></tr>
+  <tr><td>None</td><td>Common for pure caches</td><td>Everything (refill from the DB)</td></tr>
+</table></div>
+<p><a href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/">Source</a></p>
+
+<h2>Local setup</h2>
+<pre>docker run -d --name redis-stack -p 6379:6379 -p 8001:8001 redis/redis-stack:latest
+docker exec -it redis-stack redis-cli
+open http://localhost:8001   # RedisInsight</pre>
+
+<h2>node-redis</h2>
+<pre>import { createClient } from "redis";
+const redis = createClient({ url: "redis://localhost:6379" });
+redis.on("error", (e) =&gt; console.error(e));
+await redis.connect();
+
+await redis.set("post:10", JSON.stringify(obj), { EX: 600 });
+const hit = await redis.get("post:10");          // string | null
+await redis.set("lock:seat:4", "1", { NX: true }); // set-if-absent</pre>
+<p><a href="https://redis.io/docs/latest/develop/clients/nodejs/">Source</a> · Key convention: <code>entity:id</code></p>
+</main>
+</body>
+</html>

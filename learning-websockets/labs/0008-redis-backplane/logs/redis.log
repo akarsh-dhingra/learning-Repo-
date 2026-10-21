@@ -1,0 +1,15 @@
+33968:C 21 Oct 2026 17:08:42.733 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+33968:C 21 Oct 2026 17:08:42.733 * Redis version=8.4.0, bits=64, commit=c98457b6, modified=0, pid=33968, just started
+33968:C 21 Oct 2026 17:08:42.733 * Configuration loaded
+33968:M 21 Oct 2026 17:08:42.734 * monotonic clock: POSIX clock_gettime
+33968:M 21 Oct 2026 17:08:42.735 # Failed to write PID file: Permission denied
+33968:M 21 Oct 2026 17:08:42.735 * Running mode=standalone, port=6390.
+33968:M 21 Oct 2026 17:08:42.735 # WARNING: The TCP backlog setting of 511 cannot be enforced because kern.ipc.somaxconn is set to the lower value of 128.
+33968:M 21 Oct 2026 17:08:42.736 * Server initialized
+33968:M 21 Oct 2026 17:08:42.736 * Ready to accept connections tcp
+33968:M 21 Oct 2026 17:24:54.758 # Client id=51 addr=[::1]:62219 laddr=[::1]:6390 fd=11 name= age=58 idle=0 flags=P db=0 sub=249 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=1637 omem=33565048 tot-mem=33575120 events=rw cmd=unsubscribe user=default redir=-1 resp=3 lib-name= lib-ver= io-thread=0 tot-net-in=14731 tot-net-out=10776875 tot-cmds=352 scheduled to be closed ASAP for overcoming of output buffer limits.
+33968:M 21 Oct 2026 17:29:07.547 # Client id=80 addr=[::1]:62947 laddr=[::1]:6390 fd=10 name= age=46 idle=4 flags=P db=0 sub=250 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=1637 omem=33565048 tot-mem=33575144 events=rw cmd=subscribe user=default redir=-1 resp=3 lib-name= lib-ver= io-thread=0 tot-net-in=14686 tot-net-out=11610535 tot-cmds=351 scheduled to be closed ASAP for overcoming of output buffer limits.
+33968:M 21 Oct 2026 17:29:35.482 # Client id=87 addr=[::1]:62957 laddr=[::1]:6390 fd=23 name= age=74 idle=0 flags=P db=0 sub=250 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=1637 omem=33565048 tot-mem=33575144 events=rw cmd=subscribe user=default redir=-1 resp=3 lib-name= lib-ver= io-thread=0 tot-net-in=36220 tot-net-out=49908734 tot-cmds=851 scheduled to be closed ASAP for overcoming of output buffer limits.
+33968:M 21 Oct 2026 18:19:16.336 * User requested shutdown...
+33968:M 21 Oct 2026 18:19:16.337 * Removing the pid file.
+33968:M 21 Oct 2026 18:19:16.337 # Redis is now ready to exit, bye bye...

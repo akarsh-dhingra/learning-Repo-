@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Leases, Fencing, Redlock</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="0009-distributed-locks-done-right.html">← 0009</a> · <a href="../reference/locks-and-limits.html">Reference: locks &amp; limits</a> · <a href="../assignments/A1-seat-hold-lock/brief.html">Assignment A1</a></nav>
+
+<span class="kicker">Lesson 0010 · Beyond the video · 25 min · Deep dive 2 of 2</span>
+<h1>Distributed locks, part 2: leases, fencing tokens, and the Redlock debate</h1>
+<p class="lede">A correct lock from Lesson 0009 can still let two clients act at once. This lesson shows exactly when, and the one technique that makes it safe anyway.</p>
+
+<div class="win"><strong>Your win:</strong> you can explain the paused-client failure on a whiteboard, add fencing tokens that make it harmless, describe Redlock and the strongest criticism of it, and decide <em>whether Redis should be the lock at all</em>, which is the senior-level part of the answer.</div>
+
+<h2>1. A Redis lock is a lease</h2>
+<p>Because of the TTL, you don't hold the lock <em>forever</em>. You hold it <em>until the lease ends</em>. The docs say mutual exclusion is guaranteed only while the holder finishes its work within that validity time, minus a little for clock drift<sup class="cite"><a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">[1]</a></sup>. Two things can break that assumption without any bug in your code.</p>
+
+<h3>Failure 1: the paused client</h3>
+<div class="timeline">t=0     A acquires lock (TTL 10s), fence = 33
+t=1     A's process freezes: GC pause, VM migration, swapped to disk…
+t=10    lease expires; Redis deletes the key
+t=11    B acquires lock, fence = 34; B books seat A1 for Bob
+t=15    A wakes up. From A's point of view no time passed. It still "holds" the lock.
+t=15    A books seat A1 for Alice  ✗  Two holders acted on the same seat.</div>
+<p>Martin Kleppmann's analysis turns on this case. A can't detect it because the pause happened <em>between</em> checking the lock and doing the write, and the storage has no way of knowing A's lease ran out<sup class="cite"><a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">[2]</a></sup>. Checking “do I still hold it?” right before writing doesn't help, because the pause can happen just after the check.</p>
+
+<h3>Failure 2: failover loses the lock</h3>
+<div class="timeline">1. A acquires the lock on the primary.
+2. The primary crashes before replicating the key (replication is async).
+3. A replica is promoted. It has never seen A's lock.
+4. B acquires the same lock.  ✗  Safety violated.</div>
+<p>The Redis docs list this exact race as the reason a primary plus replica setup isn't enough for a safe lock<sup class="cite"><a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">[1]</a></sup>.</p>
+
+<h2>2. The fix that works for both: fencing tokens</h2>
+<p>Every successful acquire returns a number that <strong>always increases</strong> (33, 34, 35…). The client sends that number with every write, and <strong>the storage rejects any write whose token is lower than one it has already accepted</strong><sup class="cite"><a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">[2]</a></sup>.</p>
+<div class="timeline">t=11    B writes seat A1 with fence 34 → storage records lastFence = 34 ✓
+t=15    A writes seat A1 with fence 33 → 33 &lt; 34 → REJECTED ✓</div>
+<p>Two key points:</p>
+<ul>
+  <li><strong>The check lives in the storage, not in Redis.</strong> The storage is the one place every write passes through, so it's the only place a stale writer can be stopped. In Postgres it's one conditional update:
+<pre>UPDATE seats
+   SET holder = $1, fence = $2
+ WHERE id = $3 AND fence &lt; $2;     <span class="c">-- 0 rows updated ⇒ you were fenced off</span></pre></li>
+  <li><strong>Issue the fence atomically with the lock.</strong> In Redis, <code>INCR fence:{seat:A1}</code> runs in the <em>same</em> Lua script as <code>SET … NX PX</code>. Otherwise a client can stall between the two steps and end up with a <em>newer</em> fence than the client that acquired after it. The A1 test “do NOT advance on a failed acquire” checks this.</li>
+</ul>
+<p>The Redis docs now say it directly: if you care about correctness, <em>implement fencing tokens</em>, and don't assume you still hold a lock just because your process is alive. They also note that Redis TTLs follow the wall clock, so a jump in the system clock can expire a lock early<sup class="cite"><a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">[1]</a></sup>.</p>
+
+<h2>3. Redlock: the fault-tolerant variant</h2>
+<p>To get rid of the single point of failure without replication, the Redis docs describe <strong>Redlock</strong> across N independent primaries (they use N = 5)<sup class="cite"><a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">[1]</a></sup>:</p>
+<ol class="steps">
+  <li>Record the start time.</li>
+  <li>Try <code>SET key token NX PX ttl</code> on all N nodes in parallel, with a short per-node timeout.</li>
+  <li>You hold the lock only if you got a <strong>majority</strong> (≥ 3 of 5) <em>and</em> the total time spent is less than the TTL.</li>
+  <li>Your remaining validity = TTL − time spent (minus an allowance for clock drift).</li>
+  <li>If you failed, release on <em>all</em> nodes, retry after a random delay.</li>
+</ol>
+<p>The docs also cover what happens when a node crashes and restarts: with the default fsync of every second, a restarted node can forget a lock it granted. The fixes are <code>fsync always</code> or keeping a crashed node out for longer than the max TTL (“delayed restart”)<sup class="cite"><a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">[1]</a></sup>.</p>
+
+<h3>The debate in four lines</h3>
+<div class="correction">
+  <div><span class="label">Kleppmann (2016)</span>Locks serve either <em>efficiency</em> (avoid duplicate work) or <em>correctness</em> (avoid corruption). Redlock is heavy for the first and unsafe for the second: it depends on timing assumptions about delays, pauses and clocks, and its random tokens can't be ordered for fencing. For correctness, use a consensus system (ZooKeeper, etcd) <em>with</em> fencing<sup class="cite"><a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">[2]</a></sup>.</div>
+  <div><span class="label">antirez (reply)</span>If your storage can already reject stale tokens, it's doing the protection itself and the lock is only an optimisation. The random token can be used for check-and-set. And Redlock re-checks elapsed time after acquiring, so delays <em>during</em> acquisition don't break it; they just shorten the usable window<sup class="cite"><a href="http://antirez.com/news/101">[3]</a></sup>.</div>
+</div>
+<p>You don't need to “win” this debate in an interview. You need to show you know it exists and land on a sound conclusion: <strong>for correctness, fencing at the storage is what you rely on. The lock reduces contention.</strong></p>
+
+<h2>4. Decide: should Redis be the lock?</h2>
+<div class="table-wrap"><table>
+  <tr><th>Situation</th><th>Reasonable choice</th></tr>
+  <tr><td>Avoid duplicate work (two cron workers sending the same report, rebuilding the same cache entry)</td><td>Single-instance Redis lock. An occasional double run is acceptable (<em>efficiency</em> lock).</td></tr>
+  <tr><td>The data lives in one Postgres and the rule is “one row wins”</td><td>Let the DB enforce it: a <code>UNIQUE</code> constraint, <code>SELECT … FOR UPDATE</code>, or a conditional <code>UPDATE … WHERE</code>. The video makes the same point: use a Redis lock only when your main DB can't guarantee consistency.</td></tr>
+  <tr><td>Seat <em>hold</em> for 10 minutes during payment across services</td><td>Redis lease (fast, auto-expiring) <strong>plus</strong> a fenced or conditional write when confirming the booking in the DB.</td></tr>
+  <tr><td>Correctness-critical, and storage can't check tokens (external API, payments)</td><td>Consensus-backed lock (etcd/ZooKeeper) plus idempotency keys on the external call. Redis alone isn't enough.</td></tr>
+</table></div>
+
+<h2>5. Check yourself</h2>
+<section id="q10">
+<div class="quiz" data-explain="The pause can happen right after the check and before the write, so only a check at the storage, at write time, closes the gap.">
+  <p class="q">Why can't client A just check “do I still hold the lock?” right before writing?</p>
+  <div class="opts"><button class="opt" data-correct>A pause can follow the check</button><button class="opt">GET on locks is not allowed</button><button class="opt">The check would refresh the TTL</button><button class="opt">Redis hides keys from their holders</button></div>
+</div>
+<div class="quiz" data-explain="The storage remembers the highest token it has accepted and refuses anything lower, so a stale holder's write bounces.">
+  <p class="q">Fencing tokens work because…</p>
+  <div class="opts"><button class="opt" data-correct>Storage rejects lower tokens</button><button class="opt">Redis rejects stale clients</button><button class="opt">Tokens extend the lease</button><button class="opt">Clients compare their tokens</button></div>
+</div>
+<div class="quiz" data-explain="Async replication: the replica that got promoted never received A's key, so B can acquire it.">
+  <p class="q">With primary + replica + automatic failover, how can two clients hold one lock?</p>
+  <div class="opts"><button class="opt" data-correct>Lock key lost before replication</button><button class="opt">Both clients chose identical tokens</button><button class="opt">The replica double-applies SET NX</button><button class="opt">Failover resets every lock's TTL</button></div>
+</div>
+<div class="quiz" data-explain="Majority (3 of 5) and total acquisition time under the TTL. The remaining validity is TTL minus elapsed time minus drift.">
+  <p class="q">With Redlock and N = 5, a client holds the lock when it gets…</p>
+  <div class="opts"><button class="opt" data-correct>≥3 nodes, within the TTL</button><button class="opt">All 5 nodes, any time</button><button class="opt">1 node, first to reply</button><button class="opt">≥3 nodes, in any time</button></div>
+</div>
+<div class="quiz" data-explain="Duplicate work is only wasteful, not harmful, so this is an efficiency lock and a single Redis instance is enough.">
+  <p class="q">Two workers might both regenerate tonight's sales report. Which lock fits?</p>
+  <div class="opts"><button class="opt" data-correct>Single Redis instance lock</button><button class="opt">Redlock across five primaries</button><button class="opt">ZooKeeper with fencing tokens</button><button class="opt">A Postgres SERIALIZABLE transaction</button></div>
+</div>
+<p class="score" data-for="q10"></p>
+</section>
+
+<h2>6. Interview rep (out loud, 90 seconds)</h2>
+<p><em>“Design the seat-hold for a movie booking app. Two users tap the same seat at the same time.”</em></p>
+<details class="recall"><summary>A strong answer covers…</summary>
+<ol>
+  <li>Hold: <code>SET hold:{show:101:A1} &lt;token&gt; NX PX 600000</code> plus a fence via <code>INCR</code> in the same script. The first to tap wins and the others see “unavailable”.</li>
+  <li>Abandon: the TTL expires and the seat frees itself, so no cleanup job is needed.</li>
+  <li>Confirm: after payment, <code>UPDATE seats … WHERE id = $3 AND fence &lt; $2</code> (or a <code>UNIQUE(show_id, seat)</code> on bookings). The DB is the final judge.</li>
+  <li>Release with compare-and-delete. Never a plain <code>DEL</code>.</li>
+  <li>Failure modes: GC pauses or failover can create two holders, and the fenced write makes that harmless. Redlock or etcd only if the lock alone must be correct.</li>
+  <li>Idempotency key on the payment call so a retry doesn't charge twice.</li>
+</ol></details>
+
+<div class="assignment">
+<h3>Now the dedicated assignment: A1, all parts</h3>
+<p class="meta">2–3 hours · 15 automated tests · 8 written design questions</p>
+<p>Finish parts 3, 4 and 6 (fencing, extend, the paused-client test), then answer <code>DESIGN.md</code>. The test suite is checked against the reference solution, and each test is designed to fail on one specific common mistake (plain <code>DEL</code>, non-atomic fence, no <code>finally</code>, unchecked extend, no fencing check). I've verified that each mistake fails its test.</p>
+<p><a href="../assignments/A1-seat-hold-lock/brief.html"><strong>Open the A1 brief →</strong></a></p>
+</div>
+
+<div class="source"><h3>Primary sources (read both, ≈25 min)</h3>
+<p>1. Martin Kleppmann, <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">How to do distributed locking</a>. The diagrams of the pause and the fencing token are the clearest explanation anywhere.<br>
+2. The rest of <a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">Distributed Locks with Redis</a>, from “The Redlock Algorithm” to the end, including the consistency disclaimer.<br>
+Optional: antirez's reply, <a href="http://antirez.com/news/101">Is Redlock safe?</a></p></div>
+<div class="ask"><h3>Want to go deeper?</h3><p>Ask me to walk through the Redlock safety argument with numbers, to compare etcd leases with Redis leases, or to grade your <code>DESIGN.md</code>.</p></div>
+
+<footer class="next">
+  <a href="0009-distributed-locks-done-right.html">← 0009</a>
+  <a href="index.html">Course map →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,3 @@
+[node-2] whiteboard node on http://localhost:8082/?room=demo
+[node-2] draining (SIGTERM): 0 sockets over 5000ms
+[node-2] drained, exiting

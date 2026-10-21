@@ -1,0 +1,13 @@
+{
+  "name": "lab-0008-rate-limiter",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "hammer": "node hammer.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "redis": "^5.8.0"
+  }
+}

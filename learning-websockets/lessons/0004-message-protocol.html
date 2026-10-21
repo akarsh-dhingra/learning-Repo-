@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Message Protocol Design</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="../reference/backend-patterns.html">Reference: backend patterns</a> · Lesson 4</nav>
+
+<span class="kicker">Lesson 0004 · Build · ~40 min</span>
+<h1>Design the message protocol</h1>
+<p class="lede">A WebSocket gives you a pipe, not an API. Before you build rooms, give every message one shape, one router, and one way to fail.</p>
+
+<div class="win"><strong>You'll build:</strong> a Bun server with a typed message router, Zod validation, request/response over the socket (acks and errors matched by <code>id</code>), and a chat lobby on top. <strong>Done when:</strong> 10/10 checks pass against your server.</div>
+
+<h2>1. Why you need a protocol</h2>
+<p>With HTTP you get routes, status codes and request/response for free. A WebSocket gives you <code>message(ws, data)</code> and nothing else. Every real app ends up building the same three pieces. Build them deliberately on day one:</p>
+<ol class="steps">
+  <li><strong>An envelope</strong>: every message is <code>{ type, id?, data? }</code>. The <code>type</code> is your “route”.</li>
+  <li><strong>A router</strong>: a map from <code>type</code> to a handler, with a <strong>schema per type</strong>. Never trust client JSON.</li>
+  <li><strong>Request/response</strong>: if the client sends an <code>id</code>, it gets back exactly one <code>ack</code> or <code>error</code> with the same <code>id</code>. Without this, the client can't know whether a stroke or an order “landed”.</li>
+</ol>
+<div class="table-wrap"><table>
+  <tr><th>Direction</th><th>Shape</th><th>Example</th></tr>
+  <tr><td>client → server</td><td><code>{ type, id?, data? }</code></td><td><code>{"type":"chat.send","id":"7","data":{"text":"hi"}}</code></td></tr>
+  <tr><td>server → client (reply)</td><td><code>{ type:"ack", id, data }</code></td><td><code>{"type":"ack","id":"7","data":{"delivered":true}}</code></td></tr>
+  <tr><td>server → client (failure)</td><td><code>{ type:"error", id?, data:{ code, message } }</code></td><td><code>{"type":"error","id":"7","data":{"code":"invalid",…}}</code></td></tr>
+  <tr><td>server → client (event)</td><td><code>{ type, data }</code></td><td><code>{"type":"chat.message","data":{"from":"alice",…}}</code></td></tr>
+</table></div>
+<p>Error codes are a small fixed set the client can switch on: <code>bad_json</code>, <code>bad_envelope</code>, <code>unknown_type</code>, <code>invalid</code>, <code>forbidden</code>, <code>internal</code>. Message text is for humans. Codes are for code. One rule matters a lot: <strong>a bad message gets an error, not a disconnect</strong>. Drop the connection only for abuse (lesson 0011's rate limit).</p>
+
+<h2>2. Set up your build folder</h2>
+<p>You'll grow <em>one</em> server through lessons 0004 → 0008 and 0012. Write it yourself. The reference is in <code>labs/0004-message-protocol/</code> if you get stuck.</p>
+<pre>mkdir -p ~/learning-websockets/build/rooms && cd ~/learning-websockets/build/rooms
+bun init -y
+bun add zod</pre>
+
+<h2>3. Build the router (<code>protocol.ts</code>)</h2>
+<p>The core idea in ~40 lines. Handlers return a value, and the router turns it into an ack. Handlers <code>throw new ClientError(code, msg)</code>, and the router turns that into an error. Anything else that throws is a bug: log it and send <code>internal</code>. Never leak the stack trace to the client.</p>
+<pre>import { z } from "zod";
+import type { ServerWebSocket } from "bun";
+
+export const Envelope = z.object({
+  type: z.string().min(1).max(64),
+  id: z.string().max(64).optional(),
+  data: z.unknown().optional(),
+});
+export class ClientError extends Error {
+  constructor(public code: string, message: string) { super(message); }
+}
+export const send = (ws: ServerWebSocket&lt;any&gt;, type: string, data?: unknown, extra = {}) =&gt;
+  ws.send(JSON.stringify({ type, ...extra, data }));
+
+export function createRouter&lt;D&gt;() {
+  const routes = new Map&lt;string, { schema: z.ZodType; handler: Function }&gt;();
+  return {
+    on&lt;S extends z.ZodType&gt;(type: string, schema: S,
+        handler: (ctx: { ws: ServerWebSocket&lt;D&gt;; data: z.infer&lt;S&gt;; id?: string }) =&gt; unknown) {
+      routes.set(type, { schema, handler });
+      return this;                                   <span class="c">// chainable</span>
+    },
+    async handle(ws: ServerWebSocket&lt;D&gt;, raw: string | Buffer) {
+      let id: string | undefined;
+      try {
+        let json; try { json = JSON.parse(String(raw)); } catch { throw new ClientError("bad_json", "not JSON"); }
+        const env = Envelope.safeParse(json);
+        if (!env.success) throw new ClientError("bad_envelope", "expected { type, id?, data? }");
+        id = env.data.id;
+        const route = routes.get(env.data.type);
+        if (!route) throw new ClientError("unknown_type", `unknown type ${env.data.type}`);
+        const parsed = route.schema.safeParse(env.data.data);
+        if (!parsed.success) throw new ClientError("invalid", z.prettifyError(parsed.error));
+        const result = await route.handler({ ws, data: parsed.data, id });
+        if (id) send(ws, "ack", result ?? null, { id });   <span class="c">// no id → fire-and-forget, no reply</span>
+      } catch (err) {
+        if (err instanceof ClientError) send(ws, "error", { code: err.code, message: err.message }, { id });
+        else { console.error(err); send(ws, "error", { code: "internal", message: "internal error" }, { id }); }
+      }
+    },
+  };
+}</pre>
+
+<h2>4. Build the server (<code>server.ts</code>)</h2>
+<p>Spec for this lesson's server (the checks test exactly this):</p>
+<ul>
+  <li>Upgrade at <code>/?name=alice</code>. Store <code>{ name }</code> in <code>ws.data</code>, subscribe everyone to topic <code>"lobby"</code>, and send <code>welcome {name}</code> on open.</li>
+  <li><code>ping</code> → ack <code>{ time: Date.now() }</code>. <code>echo</code> → ack with the same data.</li>
+  <li><code>chat.send {text}</code>: trimmed, 1–500 chars. Broadcast <code>chat.message {from, text, at}</code> to everyone, sender included, and ack <code>{delivered:true}</code>. Text starting with <code>/admin</code> → <code>forbidden</code>, not broadcast.</li>
+</ul>
+<pre>const router = createRouter&lt;{ name: string }&gt;()
+  .on("ping", z.unknown(), () =&gt; ({ time: Date.now() }))
+  .on("echo", z.unknown(), ({ data }) =&gt; data)
+  .on("chat.send", z.object({ text: z.string().trim().min(1).max(500) }), ({ ws, data }) =&gt; {
+    if (data.text.startsWith("/admin")) throw new ClientError("forbidden", "you are not an admin");
+    server.publish("lobby", JSON.stringify({ type: "chat.message",
+      data: { from: ws.data.name, text: data.text, at: Date.now() } }));
+    return { delivered: true };
+  });
+
+const server = Bun.serve({
+  port: 8080,
+  fetch(req, server) {
+    const name = new URL(req.url).searchParams.get("name")?.slice(0, 32) || "anon";
+    if (server.upgrade(req, { data: { name } })) return;
+    return new Response("WebSocket only", { status: 426 });
+  },
+  websocket: {
+    data: {} as { name: string },
+    open(ws) { ws.subscribe("lobby"); send(ws, "welcome", { name: ws.data.name }); },
+    message(ws, raw) { router.handle(ws, raw); },
+  },
+});</pre>
+
+<h2>5. Check it</h2>
+<pre>bun server.ts                                                        <span class="c"># terminal 1 (your build)</span>
+URL=http://localhost:8080 bun test ~/learning-websockets/labs/0004-message-protocol/check.test.ts</pre>
+<p>The checks connect as real clients and test every rule above: garbage JSON keeps the socket alive, unknown types echo the <code>id</code>, the 501-char limit, sender-included broadcast, and <code>/admin</code> never broadcast. Red → read the failure message → fix → rerun. That loop is the lesson.</p>
+
+<div class="correction">
+  <div><span class="label">Tempting</span>Name events after UI actions (<code>"buttonClicked"</code>), send whole objects “just in case”, and add <code>id</code> to every message.</div>
+  <div><span class="label">Better</span>Name by domain, <code>noun.verb</code>: <code>chat.send</code>, <code>stroke.add</code>, <code>order.place</code>. Send the minimum. Use an <code>id</code> only when the client needs to know the outcome. High-frequency fire-and-forget traffic (cursors, positions) has no <code>id</code> and no ack.</div>
+</div>
+
+<h2>6. Check yourself</h2>
+<section id="quiz4">
+<div class="quiz" data-explain="Only the bad message fails. Closing the socket on a validation error turns one client bug into a reconnect storm and lost state.">
+  <p class="q">A client sends <code>chat.send</code> with a 900-character text. You should…</p>
+  <div class="opts">
+    <button class="opt" data-correct>Reply error invalid, keep socket open</button>
+    <button class="opt">Close the socket with code 1009</button>
+    <button class="opt">Truncate silently and broadcast it anyway</button>
+    <button class="opt">Ignore it without sending any reply</button>
+  </div>
+</div>
+<div class="quiz" data-explain="Cursors are latest-value-wins and very frequent. An ack per cursor would double the traffic for no benefit.">
+  <p class="q">Which message should NOT carry an <code>id</code>?</p>
+  <div class="opts">
+    <button class="opt">Placing a buy order</button>
+    <button class="opt">Saving a drawn stroke</button>
+    <button class="opt" data-correct>Moving your mouse cursor</button>
+    <button class="opt">Renaming a shared document</button>
+  </div>
+</div>
+<div class="quiz" data-explain="Unexpected exceptions are server bugs. Log the real error for yourself, but send only a generic internal code so you never leak internals.">
+  <p class="q">A handler throws <code>TypeError: cannot read 'x' of undefined</code>. The client receives…</p>
+  <div class="opts">
+    <button class="opt">The full stack trace for debugging</button>
+    <button class="opt" data-correct>Error internal, with a generic message</button>
+    <button class="opt">Nothing, because the socket just closes</button>
+    <button class="opt">An ack with null as data</button>
+  </div>
+</div>
+<p class="score" data-for="quiz4"></p>
+</section>
+
+<h2>7. System-design rep</h2>
+<p>60 seconds, out loud: <em>“Your mobile app and web app share one WebSocket API. Next month you'll change <code>chat.message</code>'s fields. How do you avoid breaking old app versions?”</em></p>
+<details class="recall"><summary>A strong answer covers…</summary>
+<ul>
+  <li>Make only additive changes to existing types: add fields, never rename or remove them. Old clients ignore unknown fields.</li>
+  <li>For a breaking change, use a new type (<code>chat.message.v2</code>) or a protocol version negotiated at connect time (<code>?v=2</code>, or the <code>Sec-WebSocket-Protocol</code> header), and serve both until old versions die out.</li>
+  <li>Use Zod schemas as the single source of truth. Share the types with the client (a monorepo package) so drift becomes a compile error.</li>
+</ul></details>
+
+<div class="assignment">
+<h3>Assignment A4: make it yours</h3>
+<p class="meta">~30 min · in ~/learning-websockets/build/rooms</p>
+<ol>
+  <li>Get the 10 checks green against <em>your</em> server.</li>
+  <li>Add <code>chat.typing</code> (no id, no ack): broadcast <code>{from}</code> to everyone <em>except</em> the sender. Hint: <code>ws.publish</code> vs <code>server.publish</code>.</li>
+  <li>Write the browser half: a <code>request(type, data)</code> function that returns a Promise resolved by the matching ack (or rejected by the error), with a 5 s timeout. Compare with <code>labs/0005-whiteboard-rooms/public/client.js</code> afterwards.</li>
+</ol>
+<p>Paste your <code>protocol.ts</code> and the test output in the terminal for review.</p>
+</div>
+
+<div class="source">
+<h3>Primary source</h3>
+<p>Skim <a href="https://zod.dev/basics">Zod: Basic usage</a> (parse vs <code>safeParse</code>, inferring types). Then read how a production exchange designs its socket API: <a href="https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-api.md">Binance WebSocket API docs</a> (the “Request format” and “Response format” sections). Notice their request <code>id</code>, status codes and error object. It's the same pattern you just built.</p>
+</div>
+
+<div class="ask">
+<h3>Stuck on anything?</h3>
+<p>Ask me in the terminal. For example: “JSON vs MessagePack for game positions?”, “how do I share these Zod schemas with a React client?”, or paste a failing check.</p>
+</div>
+
+<footer class="next">
+  <a href="0003-the-socket-layer-in-production.html">← Lesson 0003 · The socket layer in production</a>
+  <a href="0005-whiteboard-rooms.html">Next: Lesson 0005 · Excalidraw-style rooms →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

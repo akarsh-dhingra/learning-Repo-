@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis Backplane</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="../reference/backend-patterns.html">Reference: backend patterns</a> · Lesson 8</nav>
+
+<span class="kicker">Lesson 0008 · Build · ~90 min</span>
+<h1>Many nodes, one room: the Redis backplane</h1>
+<p class="lede">Pattern A from lesson 0003, for real. Three Bun nodes, any user on any node, rooms that span them all, and resume that works even when you reconnect to a different node.</p>
+
+<div class="win"><strong>You'll build:</strong> your 0007 server, with room state, seq numbers, the resume log and presence moved into Redis, and Redis Pub/Sub as the backplane between nodes. <strong>Done when:</strong> 7/7 checks pass against two of your nodes, and a browser on <code>:8081</code> sees strokes drawn on <code>:8082</code>.</div>
+
+<h2>1. What has to move out of process memory</h2>
+<div class="table-wrap"><table>
+  <tr><th>State</th><th>0007 (one node)</th><th>0008 (many nodes)</th></tr>
+  <tr><td>Who's on <em>this</em> node, in which room</td><td><code>Map</code></td><td><code>Map</code> (still local: only this node can write to its sockets)</td></tr>
+  <tr><td>Strokes (the scene)</td><td><code>room.strokes</code></td><td>Redis list <code>room:{id}:strokes</code></td></tr>
+  <tr><td>seq + resume log</td><td><code>room.seq</code>, <code>room.log</code></td><td><code>INCR room:{id}:seq</code>, capped list <code>room:{id}:log</code></td></tr>
+  <tr><td>Epoch</td><td>random per process</td><td><code>SET room:{id}:epoch … NX</code> (survives node restarts!)</td></tr>
+  <tr><td>Presence</td><td><code>Map&lt;userId, conns&gt;</code></td><td><code>HINCRBY room:{id}:conns userId ±1</code></td></tr>
+  <tr><td>Fan-out</td><td><code>server.publish</code></td><td>Redis <code>PUBLISH ch:room:{id}</code> → every node → local <code>server.publish</code></td></tr>
+</table></div>
+
+<h2>2. The one rule that keeps it correct</h2>
+<div class="win"><strong>Every room message goes <em>through</em> Redis, and a node only fans out what it <em>receives</em> from Redis, including its own events.</strong></div>
+<p>Why not fan out locally right away and publish to Redis for the other nodes? Because then node 1's users could see seq 6 (local, instant) before seq 5 (from node 2, via Redis). The client would treat 5 as a duplicate and drop it. That's silent data loss. Redis Pub/Sub delivers messages in the order they were published<sup class="cite"><a href="https://redis.io/docs/latest/develop/pubsub/">[1]</a></sup>, so if seq assignment <em>and</em> publish happen as one atomic step, everyone sees the same order.</p>
+<p>That atomic step is a Lua script. Redis runs a script without interleaving other commands:</p>
+<pre>local seq = redis.call('INCR', KEYS[1])                                    -- room:{id}:seq
+local msg = '{"type":"' .. ARGV[1] .. '","seq":' .. seq .. ',"data":' .. ARGV[2] .. '}'
+if ARGV[3] == 'add'   then redis.call('RPUSH', KEYS[3], ARGV[4]) end         -- the scene
+if ARGV[3] == 'clear' then redis.call('DEL',   KEYS[3]) end
+redis.call('RPUSH', KEYS[2], msg)                                          -- resume log…
+redis.call('LTRIM', KEYS[2], -200, -1)                                     -- …capped at 200
+redis.call('PUBLISH', KEYS[4], msg)                                        -- ch:room:{id}
+return seq</pre>
+<p>Consequences you'll see in the checks: the sender now <em>also</em> receives its own <code>stroke.added</code> (with its seq), and its own <code>user.joined</code>. Clients dedupe strokes by id and ignore their own user id. Those are small prices for a single ordering.</p>
+
+<h2>3. Build it</h2>
+<p>Bun has a built-in Redis client with Pub/Sub (<code>import { RedisClient } from "bun"</code>)<sup class="cite"><a href="https://bun.com/docs/runtime/redis">[2]</a></sup>. A subscribed connection can't run other commands, so make a second one with <code>await redis.duplicate()</code>. Reference: <code>labs/0008-redis-backplane/rooms.ts</code> (all Redis code) and <code>server.ts</code>.</p>
+<h3>Step 1: subscribe per room, ref-counted</h3>
+<pre>const subs = new Map&lt;string, { count: number; ready: Promise&lt;unknown&gt;; listener: (m: string) =&gt; void }&gt;();
+export async function attach(room: string, deliver: (room: string, msg: string) =&gt; void) {
+  let s = subs.get(room);
+  if (!s) { const listener = (m: string) =&gt; deliver(room, m);
+            subs.set(room, (s = { count: 0, listener, ready: sub.subscribe(`ch:room:${room}`, listener) })); }
+  s.count++;
+  await s.ready;                <span class="c">// the 2nd local joiner waits for the SAME subscribe</span>
+}
+export async function detach(room: string) {
+  const s = subs.get(room);
+  if (!s || --s.count &gt; 0) return;
+  subs.delete(room);
+  try { await s.ready; await sub.unsubscribe(`ch:room:${room}`, s.listener); }
+  catch (err) { console.error(err); }   <span class="c">// cleanup must never crash the node</span>
+}</pre>
+<p>That <code>try</code> isn't decoration. While testing lesson 0011, a client that disconnected <em>while its subscribe was still in flight</em> made <code>unsubscribe</code> throw, and the unhandled rejection killed the whole gateway. Await <code>ready</code> first, and unsubscribe only your own listener.</p>
+
+<h3>Step 2: open() in the right order</h3>
+<pre>async open(ws) {
+  ws.subscribe(room); localRoom(room).sockets.add(ws);
+  await rooms.attach(room, deliver);        <span class="c">// 1. start receiving live events…</span>
+  const snap = await rooms.snapshot(room);  <span class="c">// 2. …THEN read the snapshot</span>
+  send(ws, canResume ? "room.resume" : "room.state", …);
+  if (await rooms.presenceJoin(room, user)) rooms.emitEphemeral(room, "user.joined", { user });
+}</pre>
+<p>Subscribe <em>before</em> the snapshot, so nothing falls in the gap. Some events will then arrive <em>before</em> <code>room.state</code>. The client buffers anything with a <code>seq</code> until it has the snapshot, then replays only <code>seq &gt; snapshot.seq</code>. That's the <strong>snapshot + buffered deltas</strong> pattern, which comes back in lesson 0011 as the official way to sync a CEX order book. See the <code>synced</code>/<code>early</code> logic in <code>labs/0008-redis-backplane/public/client.js</code>.</p>
+
+<h3>Step 3: deliver() is the only fan-out</h3>
+<pre>function deliver(room: string, msg: string) {
+  const lr = local.get(room); if (!lr) return;
+  if (msg.startsWith('{"type":"cursors"')) { <span class="c">/* per-socket send with SOFT limit, as in 0007 */</span> return; }
+  server.publish(room, msg);
+  for (const ws of lr.sockets) if (ws.getBufferedAmount() &gt; HARD_LIMIT) { stats.kicked++; ws.terminate(); }
+}</pre>
+<p>Each node still batches <em>its own</em> users' cursors per tick and publishes the batch to Redis.</p>
+
+<h2>4. Run a cluster and check it</h2>
+<pre>cd ~/learning-websockets/labs/0008-redis-backplane
+./start-cluster.sh            <span class="c"># redis-server on 6390 + nodes on 8081, 8082, 8083 (logs/)</span>
+bun test check.test.ts        <span class="c"># or URL_A=… URL_B=… against your own nodes</span>
+open "http://localhost:8081/?room=demo&amp;name=a"; open "http://localhost:8082/?room=demo&amp;name=b"
+./stop-cluster.sh             <span class="c"># --all also stops Redis</span></pre>
+<p>Run your own build the same way: <code>NODE_ID=a PORT=8081 bun server.ts</code> and <code>NODE_ID=b PORT=8082 bun server.ts</code>. The checks include the hardest property: 20 interleaved writes from two nodes arrive at <em>both</em> clients as one gap-free, identically ordered sequence. In production, a load balancer sits in front. <code>nginx.conf</code> in the lab shows the WebSocket-specific lines (<code>Upgrade</code>/<code>Connection</code> headers aren't forwarded by default, and the 60 s read timeout)<sup class="cite"><a href="https://nginx.org/en/docs/http/websocket.html">[3]</a></sup>.</p>
+
+<h2>5. Check yourself</h2>
+<section id="quiz8">
+<div class="quiz" data-explain="Local fan-out plus Redis for others lets two nodes' events arrive in different orders on different nodes. With seq-based dedupe, a lower seq arriving late is dropped as a duplicate.">
+  <p class="q">Why not fan out your own node's events locally, without the Redis round trip?</p>
+  <div class="opts">
+    <button class="opt">Bun forbids publishing outside of a subscription</button>
+    <button class="opt" data-correct>Nodes see different orders and lose events</button>
+    <button class="opt">Redis would then publish every event twice</button>
+    <button class="opt">Local fan-out is much slower than Redis</button>
+  </div>
+</div>
+<div class="quiz" data-explain="Subscribing first means every event after that point reaches you; reading the snapshot second means it includes everything before. Duplicates are resolved by seq.">
+  <p class="q">A joiner should…</p>
+  <div class="opts">
+    <button class="opt">Read the snapshot, then subscribe</button>
+    <button class="opt" data-correct>Subscribe, then read the snapshot</button>
+    <button class="opt">Subscribe only after first event</button>
+    <button class="opt">Skip snapshots, replay the log</button>
+  </div>
+</div>
+<div class="quiz" data-explain="Redis Pub/Sub is at-most-once: while the subscriber is disconnected, messages are simply not delivered to it. Clients notice the seq gap on the next event or resume.">
+  <p class="q">Node 2's Redis subscriber reconnects after a 3 s blip. Its users…</p>
+  <div class="opts">
+    <button class="opt">Get the missed events from Redis automatically</button>
+    <button class="opt">Get missed events from node 1 instead</button>
+    <button class="opt" data-correct>Missed them; they must resume by seq</button>
+    <button class="opt">Are unaffected, since Pub/Sub buffers per channel</button>
+  </div>
+</div>
+<p class="score" data-for="quiz8"></p>
+</section>
+
+<h2>6. System-design rep</h2>
+<p>60 seconds: <em>“Your backplane is Redis Pub/Sub. What breaks first as you grow, and what are your options?”</em></p>
+<details class="recall"><summary>A strong answer covers…</summary>
+<ul>
+  <li>Every node receives every message for every room it has a member in. With users spread randomly, that's nearly every room, so backplane traffic grows with nodes × rooms. Lesson 0012 measures this breaking.</li>
+  <li>Fixes: room affinity at the load balancer (rooms mostly live on one node), sharded Pub/Sub in Redis Cluster (<code>SPUBLISH</code>), or move to Pattern B (room owners, lesson 0010).</li>
+  <li>At-most-once delivery: gaps are covered by seq + resume. If you need durable fan-out, use Redis Streams, NATS JetStream or Kafka.</li>
+  <li>Redis is now a dependency for every message. Plan for Redis HA (replica + Sentinel, or managed), and decide what nodes do while Redis is down.</li>
+</ul></details>
+
+<div class="assignment">
+<h3>Assignment A8</h3>
+<p class="meta">~60 min · build/rooms</p>
+<ol>
+  <li>Make your build multi-node and get 7/7 checks green.</li>
+  <li>Kill Redis (<code>redis-cli -p 6390 shutdown nosave</code>) while two browsers are drawing. What happens? Make the node report it: <code>/healthz</code> returns 503 while Redis is unreachable.</li>
+  <li>Presence leaks when a node crashes (its <code>HINCRBY -1</code> never runs). Sketch a fix in a few sentences. Lesson 0010 implements one.</li>
+</ol>
+</div>
+
+<div class="source">
+<h3>Primary source</h3>
+<p>Redis docs: <a href="https://redis.io/docs/latest/develop/pubsub/">Pub/Sub</a> (delivery semantics and sharded Pub/Sub) and <a href="https://redis.io/docs/latest/develop/programmability/eval-intro/">Scripting with Lua</a> (why scripts are atomic). Socket.IO's <a href="https://socket.io/docs/v4/redis-adapter/">Redis adapter</a> docs describe the same architecture as a library.</p>
+</div>
+
+<div class="ask"><h3>Stuck on anything?</h3><p>Ask me in the terminal. For example: “Redis Streams instead of Pub/Sub, how would that look?” or “how do I run this with Docker Compose and nginx?”</p></div>
+
+<footer class="next">
+  <a href="0007-backpressure.html">← Lesson 0007 · Backpressure</a>
+  <a href="0009-world-interest-management.html">Next: Lesson 0009 · A Gather-style world →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

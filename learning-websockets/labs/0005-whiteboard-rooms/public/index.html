@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini Whiteboard</title>
+<style>
+  :root { --bg: #f8f7f4; --fg: #1d1c1a; --muted: #6b6760; --rule: #e4e0d8; --card: #fff; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161514; --fg: #ecebe7; --muted: #a29d94; --rule: #34322e; --card: #1d1c1a; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  header { display: flex; flex-wrap: wrap; gap: .8rem; align-items: center; padding: .6rem 16px; border-bottom: 1px solid var(--rule); }
+  header b { font-weight: 600; }
+  #status { color: var(--muted); }
+  #users { display: flex; gap: .4rem; flex-wrap: wrap; margin-left: auto; }
+  #users span { padding: .15rem .5rem; border-radius: 999px; color: #fff; font-size: 12px; }
+  button, input[type=color] { font: inherit; padding: .3rem .7rem; border: 1px solid var(--rule); background: var(--card); color: var(--fg); border-radius: 6px; cursor: pointer; }
+  input[type=color] { padding: 0; width: 2.2rem; height: 2rem; }
+  #wrap { position: relative; margin: 16px; }
+  canvas { width: 100%; height: auto; display: block; background: #fff; border: 1px solid var(--rule); border-radius: 8px; touch-action: none; }
+  #cursors { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+  .cursor { position: absolute; font-size: 12px; white-space: nowrap; transform: translate(-4px, -4px); color: #1d1c1a; background: rgba(255,255,255,.85); padding: 0 4px 0 2px; border-radius: 4px; }
+  .cursor i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: -1px; }
+</style>
+</head>
+<body>
+<header>
+  <b>Room <span id="room"></span></b>
+  <input type="color" id="color" value="#1971c2" aria-label="Stroke colour">
+  <button id="clear">Clear for everyone</button>
+  <span id="status">connecting…</span>
+  <div id="users"></div>
+</header>
+<div id="wrap">
+  <canvas id="board" width="1200" height="800"></canvas>
+  <div id="cursors"></div>
+</div>
+<script type="module">
+  import { createClient } from "./client.js";
+
+  const params = new URLSearchParams(location.search);
+  const room = params.get("room") || "demo";
+  const name = params.get("name") || prompt("Your name?") || "anon";
+  document.getElementById("room").textContent = room;
+
+  const client = createClient(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/?room=${room}&name=${encodeURIComponent(name)}`);
+  const canvas = document.getElementById("board");
+  const ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+  let strokes = [];
+  const users = new Map();
+  const cursors = new Map(); // userId → element
+
+  function drawStroke(s) {
+    ctx.strokeStyle = s.color; ctx.lineWidth = s.width; ctx.lineCap = ctx.lineJoin = "round";
+    ctx.beginPath();
+    s.points.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    if (s.points.length === 1) ctx.lineTo(s.points[0][0] + 0.1, s.points[0][1]);
+    ctx.stroke();
+  }
+  const redraw = () => { ctx.clearRect(0, 0, canvas.width, canvas.height); strokes.forEach(drawStroke); };
+  function renderUsers() {
+    document.getElementById("users").innerHTML = [...users.values()]
+      .map((u) => `<span style="background:${u.color}">${u.name.replace(/</g, "&lt;")}</span>`).join("");
+  }
+
+  // ── server events ──
+  client.on("room.state", ({ you, users: list, strokes: s }) => {
+    users.clear(); [you, ...list].forEach((u) => users.set(u.id, u));
+    strokes = s; redraw(); renderUsers();
+    statusEl.textContent = `you are ${you.name}`;
+  });
+  client.on("user.joined", ({ user }) => { users.set(user.id, user); renderUsers(); });
+  client.on("user.left", ({ userId }) => { users.delete(userId); cursors.get(userId)?.remove(); cursors.delete(userId); renderUsers(); });
+  client.on("stroke.added", ({ stroke }) => { strokes.push(stroke); drawStroke(stroke); });
+  client.on("scene.cleared", () => { strokes = []; redraw(); });
+  client.on("cursor", ({ userId, x, y }) => {
+    const u = users.get(userId); if (!u) return;
+    let el = cursors.get(userId);
+    if (!el) { el = document.createElement("div"); el.className = "cursor"; el.innerHTML = `<i style="background:${u.color}"></i>${u.name.replace(/</g, "&lt;")}`; document.getElementById("cursors").appendChild(el); cursors.set(userId, el); }
+    const r = canvas.getBoundingClientRect();
+    el.style.left = (x / canvas.width) * r.width + "px";
+    el.style.top = (y / canvas.height) * r.height + "px";
+  });
+  client.on("error", (e) => console.warn("server error", e));
+  client.ws.addEventListener("close", (e) => (statusEl.textContent = `disconnected (${e.code}). Refresh to rejoin.`));
+
+  // ── local input ──
+  const toCanvas = (e) => { const r = canvas.getBoundingClientRect(); return [Math.round((e.clientX - r.left) * canvas.width / r.width), Math.round((e.clientY - r.top) * canvas.height / r.height)]; };
+  let current = null;
+  let lastCursorSent = 0;
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    current = { id: crypto.randomUUID(), color: document.getElementById("color").value, width: 3, points: [toCanvas(e)] };
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    const p = toCanvas(e);
+    const now = performance.now();
+    if (now - lastCursorSent > 33) { client.emit("cursor", { x: p[0], y: p[1] }); lastCursorSent = now; } // ≈30/s max
+    if (!current) return;
+    current.points.push(p);
+    drawStroke({ ...current, points: current.points.slice(-2) });
+  });
+  canvas.addEventListener("pointerup", async () => {
+    if (!current) return;
+    const stroke = current; current = null;
+    strokes.push(stroke); // optimistic: we already drew it
+    try { await client.request("stroke.add", { stroke }); }
+    catch (err) { strokes = strokes.filter((s) => s.id !== stroke.id); redraw(); alert(err.message); } // roll back
+  });
+  document.getElementById("clear").onclick = () => client.request("scene.clear");
+</script>
+</body>
+</html>

@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Node vs Bun, Measured</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+  svg .bar-bun { fill: var(--accent); }
+  svg .bar-node { fill: var(--muted); }
+  svg .grid { stroke: var(--rule); stroke-width: 1; }
+  svg .val { font-size: 11px; fill: var(--fg); }
+  .legend { display: flex; gap: 1.2rem; font-size: .85rem; color: var(--muted); margin: .4rem 0 0; }
+  .legend i { display: inline-block; width: .8rem; height: .8rem; border-radius: 2px; margin-right: .35rem; vertical-align: -1px; }
+</style>
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="../reference/server-api.html">Reference: Bun &amp; ws server API</a> · Lesson 2</nav>
+
+<span class="kicker">Lesson 0002 · Code · ~35 min</span>
+<h1>Node vs Bun, measured on your machine</h1>
+<p class="lede">You asked which runtime pushes more messages per second. We measured it instead of guessing: on your M4, Bun delivered roughly 7–9× more messages than Node with <code>ws</code>.</p>
+
+<div class="win"><strong>Your win for this lesson:</strong> you can write the same chat-room server in both runtimes, rerun the benchmark yourself, and explain <em>why</em> one is faster and when that difference stops mattering.</div>
+
+<h2>1. What each runtime gives you</h2>
+<ul>
+  <li><strong>Node.js</strong> has a built-in WebSocket <em>client</em> (stable since v22.4) but <strong>no built-in server</strong>. You need a library<sup class="cite"><a href="https://nodejs.org/en/learn/getting-started/websocket">[1]</a></sup>. The standard one is <a href="https://github.com/websockets/ws"><code>ws</code></a>: a WebSocket implementation in JavaScript.</li>
+  <li><strong>Bun</strong> has a server built into <code>Bun.serve</code>. It's built on <strong>uWebSockets</strong>, a C++ library, so framing, masking and broadcasting run in native code. It also has built-in pub/sub <em>topics</em><sup class="cite"><a href="https://bun.com/docs/runtime/http/websockets">[2]</a></sup>.</li>
+  <li><em>Not the same thing:</em> <strong>Socket.IO</strong> is a protocol <em>on top of</em> WebSockets, with its own packet format, rooms, acks and a long-polling fallback. A plain <code>new WebSocket()</code> client can't talk to a Socket.IO server. This course uses plain WebSockets so you learn what Socket.IO hides.</li>
+</ul>
+
+<h2>2. The same server, twice</h2>
+<p>A chat room: every message from any client is broadcast to every connected client, including the sender. Both files are in <code>labs/0002-node-vs-bun/</code>.</p>
+<div class="cols" style="display:grid;gap:1rem">
+<pre><span class="c">// server-bun.ts</span>
+const server = Bun.serve({
+  port: 8080,
+  fetch(req, server) {
+    if (server.upgrade(req)) return;      <span class="c">// sends the 101 for you</span>
+    return new Response("Expected a WebSocket upgrade", { status: 426 });
+  },
+  websocket: {                            <span class="c">// ONE handler object for all sockets</span>
+    open(ws)      { ws.subscribe("room"); },
+    message(ws, m){ server.publish("room", m); },
+  },
+});</pre>
+<pre><span class="c">// server-node.mjs</span>
+import { WebSocketServer } from "ws";
+const wss = new WebSocketServer({ port: 8080 });
+
+wss.on("connection", (ws) => {           <span class="c">// listeners per socket</span>
+  ws.on("message", (data, isBinary) => {
+    for (const client of wss.clients) {   <span class="c">// broadcast = a JS loop</span>
+      client.send(data, { binary: isBinary });
+    }
+  });
+});</pre>
+</div>
+<p>Look at the structure. Bun handles the upgrade inside a normal HTTP <code>fetch</code> handler, so you can check auth there before calling <code>server.upgrade</code>. That's the handshake from <a href="0001-what-a-websocket-really-is.html">lesson 0001</a>. Bun also has a native <code>publish</code>. With <code>ws</code>, you write the broadcast loop yourself.</p>
+
+<div class="correction">
+  <div><span class="label">Your old wsCrashCourse code</span><code>~/wsCrashCourse/index.js</code> reads <code>index.html</code> and then calls <code>res.end( )</code> with no body. The page comes back blank. Attaching <code>ws</code> to the HTTP server with <code>{ server: httpServer }</code> was right.</div>
+  <div><span class="label">Fix</span><code>return res.end(indexfile);</code>. And remember the shape: one HTTP server, two kinds of requests. Normal GETs go to your handler, and GETs with <code>Upgrade: websocket</code> go to the WebSocket server.</div>
+</div>
+
+<h2>3. The measurement</h2>
+<p><code>bench.mjs</code> opens N clients in one room. Each client keeps 32 of its own 64-byte messages in flight and sends a new one as each comes back. We count every message <em>delivered</em> to every client over 8 seconds. Same machine (Apple M4), same load generator, both servers on one process.</p>
+
+<figure>
+<svg viewBox="0 0 600 230" role="img" aria-label="Grouped bar chart of delivered messages per second. Bun: 1.52M at 16 clients, 2.06M at 64, 1.89M at 256. Node with ws: 220k, 225k, 178k.">
+  <line class="grid" x1="60" y1="190" x2="590" y2="190"/>
+  <line class="grid" x1="60" y1="125" x2="590" y2="125"/>
+  <line class="grid" x1="60" y1="60" x2="590" y2="60"/>
+  <text class="small" x="52" y="194" text-anchor="end">0</text>
+  <text class="small" x="52" y="129" text-anchor="end">1M</text>
+  <text class="small" x="52" y="64" text-anchor="end">2M</text>
+  <!-- scale: 1M = 65px -->
+  <g><title>Bun · 16 clients · 1,521,871 msgs/sec</title><rect class="bar-bun" x="90" y="91" width="56" height="99" rx="4"/></g>
+  <text class="val" x="118" y="85" text-anchor="middle">1.52M</text>
+  <g><title>Node + ws · 16 clients · 219,794 msgs/sec</title><rect class="bar-node" x="148" y="176" width="56" height="14" rx="4"/></g>
+  <text class="val" x="176" y="170" text-anchor="middle">220k</text>
+  <g><title>Bun · 64 clients · 2,061,834 msgs/sec</title><rect class="bar-bun" x="265" y="56" width="56" height="134" rx="4"/></g>
+  <text class="val" x="293" y="50" text-anchor="middle">2.06M</text>
+  <g><title>Node + ws · 64 clients · 225,215 msgs/sec</title><rect class="bar-node" x="323" y="175" width="56" height="15" rx="4"/></g>
+  <text class="val" x="351" y="169" text-anchor="middle">225k</text>
+  <g><title>Bun · 256 clients · 1,890,288 msgs/sec</title><rect class="bar-bun" x="440" y="67" width="56" height="123" rx="4"/></g>
+  <text class="val" x="468" y="61" text-anchor="middle">1.89M</text>
+  <g><title>Node + ws · 256 clients · 177,590 msgs/sec</title><rect class="bar-node" x="498" y="178" width="56" height="12" rx="4"/></g>
+  <text class="val" x="526" y="172" text-anchor="middle">178k</text>
+  <text class="small" x="147" y="210" text-anchor="middle">16 clients</text>
+  <text class="small" x="322" y="210" text-anchor="middle">64 clients</text>
+  <text class="small" x="497" y="210" text-anchor="middle">256 clients</text>
+</svg>
+<p class="legend"><span><i style="background:var(--accent)"></i>Bun 1.4.2 (Bun.serve)</span><span><i style="background:var(--muted)"></i>Node 24.15 + ws 8</span></p>
+<figcaption>Delivered messages/sec, one room, 64-byte text messages, measured 2026-10-21. Hover a bar for the exact figure.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+  <tr><th>Clients</th><th>Bun</th><th>Node + ws</th><th>Ratio</th></tr>
+  <tr><td>16</td><td>1,521,871</td><td>219,794</td><td>6.9×</td></tr>
+  <tr><td>64</td><td>2,061,834</td><td>225,215</td><td>9.2×</td></tr>
+  <tr><td>256</td><td>1,890,288</td><td>177,590</td><td>10.6×</td></tr>
+</table></div>
+<p>Bun's own docs claim about 7× on a similar chat-room test (~700k vs ~100k msgs/sec with 16 clients on older versions and hardware)<sup class="cite"><a href="https://bun.com/docs/runtime/http/websockets">[2]</a></sup>. Your numbers agree in direction and rough size.</p>
+
+<h2>4. Why Bun wins here</h2>
+<ol class="steps">
+  <li><strong>Native hot path.</strong> Parsing frames, unmasking, and building outgoing frames all happen in C++ (uWebSockets). With <code>ws</code>, that work runs in JavaScript.</li>
+  <li><strong>Native fan-out.</strong> <code>server.publish</code> hands one message to the native layer, which delivers it to every subscriber. The Node server runs a JS loop of <code>client.send()</code>, so each call does its own JS work and crosses into the I/O layer separately. In a chat room, fan-out <em>is</em> the workload: 1 message in becomes N messages out.</li>
+  <li><strong>Less per-socket overhead.</strong> Bun shares one handler object across all connections instead of attaching listeners to each socket<sup class="cite"><a href="https://bun.com/docs/runtime/http/websockets">[2]</a></sup>. That matters when you hold 100k idle Gather Town connections.</li>
+</ol>
+
+<h2>5. Read the benchmark like an engineer</h2>
+<p>A benchmark answers exactly the question it asked. Before you quote “10×” in a design review, know its limits:</p>
+<ul>
+  <li><strong>One process, one core.</strong> Both servers run JS on a single thread. Production runs one process per core, or many pods. So you'd compare 10 Bun processes against 10 Node processes, and the ratio holds but both scale up.</li>
+  <li><strong>Empty handlers.</strong> Real handlers <code>JSON.parse</code>, validate, check permissions, and call Redis. That work costs the same in both runtimes and shrinks the gap. Measure <em>your</em> handler.</li>
+  <li><strong>Same-machine load generator.</strong> The client competes with the server for CPU. Treat the numbers as relative, not absolute.</li>
+  <li><strong>At scale, the bottleneck moves.</strong> Network egress, the pub/sub backplane between servers, and slow clients usually hit you before the runtime does (lesson 0003).</li>
+  <li><strong>Need Node?</strong> <a href="https://github.com/uNetworking/uWebSockets.js">uWebSockets.js</a> brings the same C++ engine to Node.</li>
+</ul>
+<div class="win"><strong>Decision for this course:</strong> we build on <strong>Bun</strong>. It meets your “most messages per second” criterion, and its built-in topics map directly onto rooms, the core idea in Excalidraw, Gather Town and CEX channels. We'll keep socket logic behind small functions so the ideas transfer to Node + <code>ws</code> or uWebSockets.js.</div>
+
+<h2>6. The Bun API you'll use constantly</h2>
+<pre><span class="c">// Attach per-connection data at upgrade time (auth happens HERE)</span>
+fetch(req, server) {
+  const url = new URL(req.url);
+  const user = verifyToken(url.searchParams.get("token"));   <span class="c">// your function</span>
+  if (!user) return new Response("Unauthorized", { status: 401 });
+  server.upgrade(req, { data: { userId: user.id, room: url.searchParams.get("room") } });
+},
+websocket: {
+  data: {} as { userId: string; room: string },              <span class="c">// types ws.data</span>
+  open(ws)    { ws.subscribe(ws.data.room); },
+  message(ws, msg) {
+    ws.publish(ws.data.room, msg);      <span class="c">// everyone in the room EXCEPT the sender</span>
+    <span class="c">// server.publish(room, msg)        // everyone INCLUDING the sender</span>
+  },
+  close(ws, code, reason) { /* closed sockets auto-unsubscribe */ },
+  idleTimeout: 120,          <span class="c">// seconds; default 120. Bun pings for you</span>
+  maxPayloadLength: 16 * 1024 * 1024,  <span class="c">// default 16 MB; oversize → close 1009</span>
+}</pre>
+<p>One more thing to remember for later: <code>ws.send()</code> returns <code>-1</code> when the message is queued under <strong>backpressure</strong>, <code>0</code> when it's dropped, and the number of bytes sent otherwise. The <code>drain</code> handler fires when the queue empties<sup class="cite"><a href="https://bun.com/docs/runtime/http/websockets">[2]</a></sup>. Slow consumers get a whole lesson later (0007).</p>
+
+<h2>7. Recall first, then check</h2>
+<details class="recall"><summary>Why can't you write a WebSocket server in Node with zero dependencies, the way you can in Bun?</summary>
+Node ships only a WebSocket <em>client</em>. A server needs a library such as <code>ws</code>, or your own raw-TCP implementation like lesson 0001's.</details>
+<details class="recall"><summary>Give two reasons Bun delivered more messages per second.</summary>
+Frame handling runs in native C++ (uWebSockets), and <code>publish</code> fans out in native code instead of a JS loop of <code>send()</code> calls. It also has less per-socket listener overhead.</details>
+<details class="recall"><summary>Name three reasons the 7–10× won't show up as 7–10× in production.</summary>
+Real handler work is the same cost in both runtimes. You scale across cores and machines anyway. Network, backplane and slow clients often become the bottleneck first. Also, our load generator shared the machine with the server.</details>
+
+<section id="quiz2">
+<h3>Check yourself</h3>
+<div class="quiz" data-explain="ws.publish excludes the sender; server.publish includes everyone subscribed. For cursor updates you usually exclude the sender, who already knows where their own cursor is.">
+  <p class="q">In Bun, which call skips the sender when broadcasting to a room?</p>
+  <div class="opts">
+    <button class="opt">server.publish(room, msg)</button>
+    <button class="opt" data-correct>ws.publish(room, msg)</button>
+    <button class="opt">ws.send(room, msg)</button>
+    <button class="opt">server.send(room, msg)</button>
+  </div>
+</div>
+<div class="quiz" data-explain="The upgrade request is still HTTP: reject with 401/403 before calling server.upgrade, so an unauthenticated socket never exists.">
+  <p class="q">Where should you reject an unauthenticated user?</p>
+  <div class="opts">
+    <button class="opt">In open, by closing with 1008</button>
+    <button class="opt">In message, on their first message</button>
+    <button class="opt" data-correct>In fetch, before you call server.upgrade</button>
+    <button class="opt">In close, after logging the attempt</button>
+  </div>
+</div>
+<div class="quiz" data-explain="A return of -1 means the message was queued but the socket's buffer is backing up. The drain event fires when you can send freely again.">
+  <p class="q"><code>ws.send(msg)</code> returns <code>-1</code>. It means…</p>
+  <div class="opts">
+    <button class="opt">The message was dropped completely</button>
+    <button class="opt">The socket was already closed</button>
+    <button class="opt">The payload exceeded the limit</button>
+    <button class="opt" data-correct>Queued, but backpressure is building</button>
+  </div>
+</div>
+<div class="quiz" data-explain="Socket.IO adds its own packet format on top of WebSockets, so plain WebSocket clients can't speak to it without the Socket.IO client library.">
+  <p class="q">A plain browser <code>new WebSocket()</code> connects to a Socket.IO server…</p>
+  <div class="opts">
+    <button class="opt" data-correct>Fails: Socket.IO uses its own protocol</button>
+    <button class="opt">Works: Socket.IO is just plain WebSocket</button>
+    <button class="opt">Works, but only over long polling</button>
+    <button class="opt">Fails, unless sticky sessions are enabled</button>
+  </div>
+</div>
+<p class="score" data-for="quiz2"></p>
+</section>
+
+<h2>8. System-design rep</h2>
+<p>60 seconds, out loud: <em>“Your team wants to rewrite the CEX market-data gateway from Node + ws to Bun because ‘Bun is 7× faster’. What do you ask before agreeing?”</em></p>
+<details class="recall"><summary>A strong answer covers…</summary>
+<ul>
+  <li>Where's the bottleneck today? Profile it: is it CPU in framing and fan-out, JSON serialisation, the backplane, or network egress?</li>
+  <li>Benchmark <em>our</em> workload: real payload sizes, real fan-out ratio, real handler code. Look at p99 latency, not just throughput.</li>
+  <li>Cheaper options: serialise once per message rather than once per client, batch updates, or move to uWebSockets.js while staying on Node.</li>
+  <li>Risks: library compatibility in Bun, operational familiarity, and rollback plan.</li>
+</ul></details>
+
+<div class="assignment">
+<h3>Assignment A2: rerun it, then build rooms</h3>
+<p class="meta">~45 min · labs/0002-node-vs-bun/</p>
+<ol>
+  <li>Run <code>./run-bench.sh</code> yourself. Then change <code>PAYLOAD</code> to 1 KB (<code>"x".repeat(1024)</code>) and run again. Does the ratio change? Guess first, then measure.</li>
+  <li>Create <code>rooms.ts</code>: a Bun server where clients connect to <code>ws://localhost:8080/?room=abc&amp;name=akarsh</code>. Store <code>{ room, name }</code> in <code>ws.data</code>. Messages go only to the same room, <em>excluding</em> the sender, as JSON <code>{"from": name, "text": ...}</code>. Reject a missing <code>room</code> with HTTP 400.</li>
+  <li>Test it with two browser tabs in room <code>abc</code> and one in room <code>xyz</code>. The <code>xyz</code> tab must see nothing.</li>
+  <li>Write one sentence: what breaks if you run <em>two</em> copies of <code>rooms.ts</code> behind a load balancer? (That's lesson 0003.)</li>
+</ol>
+<p>Paste your numbers, code and sentence in the terminal and I'll review them.</p>
+</div>
+
+<div class="source">
+<h3>Primary source</h3>
+<p>Read Bun's <a href="https://bun.com/docs/runtime/http/websockets">WebSockets documentation</a> end to end (~15 min). It's short, precise, and covers every option used in this course. For contrast, skim the <a href="https://github.com/websockets/ws#usage-examples"><code>ws</code> README usage examples</a>, especially “How to detect and close broken connections”.</p>
+</div>
+
+<div class="ask">
+<h3>Stuck on anything?</h3>
+<p>Ask me in the terminal. For example: “how would I benchmark with clients on a different machine?”, “should I use uWebSockets.js directly?”, or “why does Node's number drop at 256 clients?”</p>
+</div>
+
+<footer class="next">
+  <a href="0001-what-a-websocket-really-is.html">← Lesson 0001 · What a WebSocket is</a>
+  <a href="0003-the-socket-layer-in-production.html">Next: Lesson 0003 · The socket layer in production →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

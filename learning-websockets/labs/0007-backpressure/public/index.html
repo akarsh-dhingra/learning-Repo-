@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini Whiteboard v3</title>
+<style>
+  :root { --bg: #f8f7f4; --fg: #1d1c1a; --muted: #6b6760; --rule: #e4e0d8; --card: #fff; --warn: #b35c00; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161514; --fg: #ecebe7; --muted: #a29d94; --rule: #34322e; --card: #1d1c1a; --warn: #f0a050; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  header { display: flex; flex-wrap: wrap; gap: .8rem; align-items: center; padding: .6rem 16px; border-bottom: 1px solid var(--rule); }
+  header b { font-weight: 600; }
+  #status { color: var(--muted); }
+  #status.warn { color: var(--warn); }
+  #users { display: flex; gap: .4rem; flex-wrap: wrap; margin-left: auto; }
+  #users span { padding: .15rem .5rem; border-radius: 999px; color: #fff; font-size: 12px; }
+  button, input[type=color] { font: inherit; padding: .3rem .7rem; border: 1px solid var(--rule); background: var(--card); color: var(--fg); border-radius: 6px; cursor: pointer; }
+  input[type=color] { padding: 0; width: 2.2rem; height: 2rem; }
+  #wrap { position: relative; margin: 16px; }
+  canvas { width: 100%; height: auto; display: block; background: #fff; border: 1px solid var(--rule); border-radius: 8px; touch-action: none; }
+  #cursors { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+  .cursor { position: absolute; font-size: 12px; white-space: nowrap; transform: translate(-4px, -4px); color: #1d1c1a; background: rgba(255,255,255,.85); padding: 0 4px 0 2px; border-radius: 4px; }
+  .cursor i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: -1px; }
+</style>
+</head>
+<body>
+<header>
+  <b>Room <span id="room"></span></b>
+  <input type="color" id="color" value="#1971c2" aria-label="Stroke colour">
+  <button id="clear">Clear for everyone</button>
+  <button id="drop" title="Simulates a network drop: the client should reconnect and resume">Drop connection</button>
+  <span id="status">logging in…</span>
+  <div id="users"></div>
+</header>
+<div id="wrap">
+  <canvas id="board" width="1200" height="800"></canvas>
+  <div id="cursors"></div>
+</div>
+<script type="module">
+  import { createClient } from "./client.js";
+
+  const params = new URLSearchParams(location.search);
+  const room = params.get("room") || "demo";
+  const name = params.get("name") || prompt("Your name?") || "anon";
+  document.getElementById("room").textContent = room;
+  const wsBase = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}`;
+
+  // Login once per tab. A refresh keeps the same identity (sessionStorage), so presence stays stable.
+  let token = null;
+  try { token = sessionStorage.getItem("token"); } catch {}
+  async function login() {
+    const res = await fetch("/login", { method: "POST", body: JSON.stringify({ name }) });
+    token = (await res.json()).token;
+    try { sessionStorage.setItem("token", token); } catch {}
+  }
+  if (!token) await login();
+
+  const statusEl = document.getElementById("status");
+  const client = createClient({
+    url: ({ lastSeq, epoch }) =>
+      `${wsBase}/?room=${room}&token=${token}` + (lastSeq !== null ? `&lastSeq=${lastSeq}&epoch=${epoch}` : ""),
+    refreshToken: login,
+    onStatus(s) {
+      statusEl.className = s.state === "open" ? "" : "warn";
+      statusEl.textContent =
+        s.state === "open" ? `connected as ${name}` :
+        s.state === "reconnecting" ? `disconnected (${s.code}), retry #${s.attempt} in ${(s.delay / 1000).toFixed(1)}s` :
+        s.state;
+    },
+  });
+
+  const canvas = document.getElementById("board");
+  const ctx = canvas.getContext("2d");
+  let strokes = [];
+  const users = new Map();
+  const cursors = new Map();
+  let myId = null;
+
+  function drawStroke(s) {
+    ctx.strokeStyle = s.color; ctx.lineWidth = s.width; ctx.lineCap = ctx.lineJoin = "round";
+    ctx.beginPath();
+    s.points.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    if (s.points.length === 1) ctx.lineTo(s.points[0][0] + 0.1, s.points[0][1]);
+    ctx.stroke();
+  }
+  const redraw = () => { ctx.clearRect(0, 0, canvas.width, canvas.height); strokes.forEach(drawStroke); };
+  const esc = (s) => s.replace(/</g, "&lt;");
+  function setUsers(you, list) {
+    myId = you.id; users.clear();
+    [you, ...list].forEach((u) => users.set(u.id, u));
+    for (const [id, el] of cursors) if (!users.has(id)) { el.remove(); cursors.delete(id); }
+    document.getElementById("users").innerHTML = [...users.values()].map((u) => `<span style="background:${u.color}">${esc(u.name)}</span>`).join("");
+  }
+
+  client.on("room.state", ({ you, users: list, strokes: s }) => { setUsers(you, list); strokes = s; redraw(); });
+  client.on("room.resume", ({ you, users: list, events }) => { setUsers(you, list); console.log(`resumed: replaying ${events.length} missed events`); });
+  client.on("user.joined", ({ user }) => setUsers(users.get(myId), [...users.values()].filter((u) => u.id !== myId).concat(user)));
+  client.on("user.left", ({ userId }) => { users.delete(userId); setUsers(users.get(myId), [...users.values()].filter((u) => u.id !== myId)); });
+  client.on("stroke.added", ({ stroke }) => { if (!strokes.some((s) => s.id === stroke.id)) { strokes.push(stroke); drawStroke(stroke); } });
+  client.on("scene.cleared", () => { strokes = []; redraw(); });
+  // 0007: cursors arrive as one batch per tick; skip our own entry (the server sends one batch to everyone)
+  client.on("cursors", (list) => list.forEach(({ userId, x, y }) => {
+    if (userId === myId) return;
+    const u = users.get(userId); if (!u) return;
+    let el = cursors.get(userId);
+    if (!el) { el = document.createElement("div"); el.className = "cursor"; el.innerHTML = `<i style="background:${u.color}"></i>${esc(u.name)}`; document.getElementById("cursors").appendChild(el); cursors.set(userId, el); }
+    const r = canvas.getBoundingClientRect();
+    el.style.left = (x / canvas.width) * r.width + "px";
+    el.style.top = (y / canvas.height) * r.height + "px";
+  }));
+
+  const toCanvas = (e) => { const r = canvas.getBoundingClientRect(); return [Math.round((e.clientX - r.left) * canvas.width / r.width), Math.round((e.clientY - r.top) * canvas.height / r.height)]; };
+  let current = null, lastCursorSent = 0;
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    current = { id: crypto.randomUUID(), color: document.getElementById("color").value, width: 3, points: [toCanvas(e)] };
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    const p = toCanvas(e), now = performance.now();
+    if (now - lastCursorSent > 33) { client.emit("cursor", { x: p[0], y: p[1] }); lastCursorSent = now; }
+    if (!current) return;
+    current.points.push(p);
+    drawStroke({ ...current, points: current.points.slice(-2) });
+  });
+  canvas.addEventListener("pointerup", async () => {
+    if (!current) return;
+    const stroke = current; current = null;
+    strokes.push(stroke);
+    try { await client.request("stroke.add", { stroke }); }
+    catch (err) { strokes = strokes.filter((s) => s.id !== stroke.id); redraw(); statusEl.textContent = `stroke lost: ${err.message}`; }
+  });
+  document.getElementById("clear").onclick = () => client.request("scene.clear").catch(() => {});
+  document.getElementById("drop").onclick = () => client.ws.close(4999, "simulated drop");
+</script>
+</body>
+</html>

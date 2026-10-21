@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini Gather</title>
+<style>
+  :root { --bg: #f8f7f4; --fg: #1d1c1a; --muted: #6b6760; --rule: #e4e0d8; --card: #fff; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161514; --fg: #ecebe7; --muted: #a29d94; --rule: #34322e; --card: #1d1c1a; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  header { display: flex; flex-wrap: wrap; gap: 1rem; padding: .6rem 16px; border-bottom: 1px solid var(--rule); color: var(--muted); }
+  header b { color: var(--fg); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 16px; padding: 16px; }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; } }
+  canvas { width: 100%; height: auto; display: block; background: #eef3ea; border-radius: 8px; border: 1px solid var(--rule); }
+  aside { display: flex; flex-direction: column; gap: .5rem; }
+  #log { flex: 1; min-height: 200px; max-height: 420px; overflow-y: auto; background: var(--card); border: 1px solid var(--rule); border-radius: 8px; padding: .5rem .7rem; }
+  #log p { margin: .2rem 0; }
+  input { font: inherit; padding: .45rem .6rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--card); color: var(--fg); width: 100%; }
+</style>
+</head>
+<body>
+<header><b>Mini Gather</b><span>Move: arrow keys / WASD</span><span id="hud"></span></header>
+<main>
+  <canvas id="view" width="900" height="600"></canvas>
+  <aside>
+    <div id="log"><p><i>Proximity chat: only people inside your circle hear you.</i></p></div>
+    <input id="say" placeholder="Say something…" maxlength="300">
+  </aside>
+</main>
+<script type="module">
+  import { createClient } from "./client.js";
+  const name = new URLSearchParams(location.search).get("name") || prompt("Your name?") || "anon";
+  const client = createClient(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/?name=${encodeURIComponent(name)}`);
+  const canvas = document.getElementById("view"), ctx = canvas.getContext("2d");
+  let me = null, world = null, radius = 300;
+  const others = new Map(); // id → { name, x, y, rx, ry }  (rx/ry = rendered position, smoothed)
+
+  client.on("world.joined", (d) => { me = { ...d.you, rx: d.you.x, ry: d.you.y }; world = d.world; radius = d.radius; });
+  client.on("tick", ({ you, enter, moves, leave }) => {
+    if (you) { me.x = you.x; me.y = you.y; }           // server's verdict wins over our prediction
+    for (const o of enter) others.set(o.id, { ...o, rx: o.x, ry: o.y });
+    for (const [id, x, y] of moves) { const o = others.get(id); if (o) { o.x = x; o.y = y; } }
+    for (const id of leave) others.delete(id);
+    document.getElementById("hud").textContent = `you (${me.x}, ${me.y}) · ${others.size} nearby`;
+  });
+  client.on("chat.message", ({ name: from, text }) => {
+    const p = document.createElement("p"); p.innerHTML = `<b></b> `; p.querySelector("b").textContent = from + ":"; p.append(text);
+    const log = document.getElementById("log"); log.append(p); log.scrollTop = log.scrollHeight;
+  });
+
+  // Input: keys held → move request 10×/s. We also move locally right away (client-side prediction).
+  const keys = new Set();
+  addEventListener("keydown", (e) => { if (e.target.tagName !== "INPUT") keys.add(e.key.toLowerCase()); });
+  addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
+  setInterval(() => {
+    if (!me) return;
+    const dx = (keys.has("arrowright") || keys.has("d")) - (keys.has("arrowleft") || keys.has("a"));
+    const dy = (keys.has("arrowdown") || keys.has("s")) - (keys.has("arrowup") || keys.has("w"));
+    if (!dx && !dy) return;
+    me.x = Math.max(0, Math.min(world.w, me.x + dx * 25));
+    me.y = Math.max(0, Math.min(world.h, me.y + dy * 25));
+    client.emit("move", { x: me.x, y: me.y });
+  }, 100);
+
+  document.getElementById("say").addEventListener("keydown", async (e) => {
+    if (e.key !== "Enter" || !e.target.value.trim()) return;
+    const text = e.target.value; e.target.value = "";
+    const { heardBy } = await client.request("chat.send", { text });
+    if (heardBy === 0) { const p = document.createElement("p"); p.innerHTML = "<i>nobody was close enough to hear that</i>"; document.getElementById("log").append(p); }
+  });
+
+  // Render at 60fps, smoothing 10Hz server updates (interpolation)
+  function frame() {
+    requestAnimationFrame(frame);
+    if (!me) return;
+    const lerp = (a, b) => a + (b - a) * 0.25;
+    me.rx = lerp(me.rx, me.x); me.ry = lerp(me.ry, me.y);
+    const ox = me.rx - canvas.width / 2, oy = me.ry - canvas.height / 2;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = "#c9d6c0"; ctx.lineWidth = 1;
+    for (let gx = Math.floor(ox / 100) * 100; gx < ox + canvas.width; gx += 100) { ctx.beginPath(); ctx.moveTo(gx - ox, 0); ctx.lineTo(gx - ox, canvas.height); ctx.stroke(); }
+    for (let gy = Math.floor(oy / 100) * 100; gy < oy + canvas.height; gy += 100) { ctx.beginPath(); ctx.moveTo(0, gy - oy); ctx.lineTo(canvas.width, gy - oy); ctx.stroke(); }
+    ctx.strokeStyle = "#1d1c1a"; ctx.lineWidth = 3; ctx.strokeRect(-ox, -oy, world.w, world.h);
+    ctx.fillStyle = "rgba(25,113,194,.08)"; ctx.beginPath(); ctx.arc(me.rx - ox, me.ry - oy, radius, 0, Math.PI * 2); ctx.fill();
+    const dot = (x, y, color, label) => {
+      ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x - ox, y - oy, 12, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#1d1c1a"; ctx.font = "12px system-ui"; ctx.textAlign = "center"; ctx.fillText(label, x - ox, y - oy - 18);
+    };
+    for (const o of others.values()) { o.rx = lerp(o.rx, o.x); o.ry = lerp(o.ry, o.y); dot(o.rx, o.ry, "#f08c00", o.name); }
+    dot(me.rx, me.ry, "#1971c2", me.name + " (you)");
+  }
+  frame();
+</script>
+</body>
+</html>

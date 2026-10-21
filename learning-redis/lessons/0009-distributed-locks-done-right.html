@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Distributed Locks, Part 1</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="index.html">Course map</a> · <a href="0008-rate-limiting.html">← 0008</a> · <a href="../reference/locks-and-limits.html">Reference: locks &amp; limits</a> · <a href="../assignments/A1-seat-hold-lock/brief.html">Assignment A1</a></nav>
+
+<span class="kicker">Lesson 0009 · Video ≈58:00 → end · 25 min · Deep dive 1 of 2</span>
+<h1>Distributed locks, part 1: a lock that's actually correct</h1>
+<p class="lede">The video's BookMyShow lock gets the idea right and the mechanics wrong. This lesson takes it apart and rebuilds it the way the Redis docs specify.</p>
+
+<div class="win"><strong>Your win:</strong> you can write <code>SET key token NX PX ttl</code> and the compare-and-delete release from memory, and explain the specific failure each part prevents. That covers parts 1, 2 and 5 of <a href="../assignments/A1-seat-hold-lock/brief.html">Assignment A1</a>.</div>
+
+<h2>1. What a lock must guarantee</h2>
+<p>The Redis docs list three properties as the minimum for a useful distributed lock<sup class="cite"><a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">[1]</a></sup>:</p>
+<ol class="steps">
+  <li><strong>Safety (mutual exclusion):</strong> at any moment, at most one client holds the lock.</li>
+  <li><strong>Deadlock-free:</strong> even if the holder crashes or gets cut off, the lock eventually becomes available again.</li>
+  <li><strong>Fault tolerant:</strong> clients can still lock and unlock while some Redis nodes are down. That's Lesson 0010.</li>
+</ol>
+<p>Keep these in mind. Every design choice below exists to protect one of them.</p>
+
+<h2>2. The video's lock, and why it breaks</h2>
+<p>The video uses a counter: each process <code>INCR</code>s the lock key. Whoever gets <code>1</code> holds the lock, anyone who gets more than 1 is blocked, a TTL frees it if the holder dies, and the holder deletes the key when done. Run it against the three properties:</p>
+<div class="table-wrap"><table>
+  <tr><th>Flaw</th><th>What goes wrong</th><th>Property broken</th></tr>
+  <tr><td>Losers <code>INCR</code> too</td><td>Every blocked attempt bumps the counter. Nothing ever decrements it, so the value means nothing beyond “not 1”.</td><td>Code smell, not a direct break</td></tr>
+  <tr><td><code>INCR</code> and TTL are separate</td><td>If the winner crashes after <code>INCR</code> but before setting the TTL, the key never expires. Nobody gets the seat again.</td><td>Deadlock-free</td></tr>
+  <tr><td>Release is a plain <code>DEL</code></td><td>A slow holder whose TTL already expired deletes the <em>next</em> holder's lock, and now a third client gets in too.</td><td>Safety</td></tr>
+  <tr><td>No owner identity</td><td>The key doesn't record <em>who</em> holds it, so nobody can check “is this still mine?” before acting.</td><td>Safety</td></tr>
+</table></div>
+
+<h2>3. The correct single-instance lock</h2>
+<h3>Acquire: one atomic command</h3>
+<pre>SET lock:seat:A1 &lt;random-token&gt; NX PX 30000</pre>
+<p><code>NX</code> sets the key only if it doesn't exist, and <code>PX</code> attaches an expiry in milliseconds, in the same atomic step. The value must be <strong>unique across all clients and all lock requests</strong>. The docs suggest 20 random bytes<sup class="cite"><a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">[1]</a></sup>. Reply <code>OK</code> means you hold it, and <code>nil</code> means someone else does.</p>
+
+<h3>Release: delete only if it's still yours</h3>
+<pre>if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("del", KEYS[1])
+else
+  return 0
+end</pre>
+<p>Because the whole script runs atomically, nobody can sneak in between the <code>GET</code> and the <code>DEL</code>. On Redis 8.4+ the single command <code>DELEX key IFEQ token</code> does the same thing<sup class="cite"><a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">[1]</a></sup>. Your container runs 7.4, so you'll use the script.</p>
+
+<h3>Watch the bug the token prevents</h3>
+<div class="timeline">t=0      A: SET lock tokA NX PX 100   → OK  (A holds it)
+t=50     A: starts a slow DB call…
+t=100    lock expires (TTL)
+t=110    B: SET lock tokB NX PX 100   → OK  (B holds it)
+t=130    A: finishes and releases
+           plain DEL         → deletes B's lock ✗  (C can now get in alongside B)
+           compare-and-del   → GET = tokB ≠ tokA → returns 0 ✓  (B keeps it)</div>
+
+<h3>Retry and always release</h3>
+<ul>
+  <li><strong>Retry with a random delay.</strong> If many clients retry on the same schedule, they keep colliding. The docs recommend a random delay before retrying<sup class="cite"><a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">[1]</a></sup>.</li>
+  <li><strong>Release in <code>finally</code>.</strong> An exception inside your critical section must not leave the lock held until the TTL runs out.</li>
+  <li><strong>Choosing the TTL.</strong> It should be comfortably longer than the work normally takes, but short enough that a crash only blocks the resource briefly. The TTL is the window in which you're guaranteed exclusivity<sup class="cite"><a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">[1]</a></sup>. If your work can run longer, you need <strong>extend</strong> (a compare-and-<code>PEXPIRE</code> script) or fencing (Lesson 0010).</li>
+</ul>
+
+<h2>4. In Node, the shape you'll build in A1</h2>
+<pre>const lock = await acquire(redis, "seat:A1", 2000);   <span class="c">// SET … NX PX via a script</span>
+if (!lock) return { ok: false, reason: "busy" };
+try {
+  const holder = await db.getSeat("A1");              <span class="c">// read…</span>
+  if (holder) return { ok: false, reason: "taken" };
+  await db.writeSeat("A1", userId, lock.fence);       <span class="c">// …then write, inside the lock</span>
+  return { ok: true };
+} finally {
+  await release(redis, lock);                          <span class="c">// compare-and-delete</span>
+}</pre>
+<p>Try <code>npm run race</code> in the assignment folder first. With no lock, I got <strong>38 of 50</strong> users told they'd booked the same seat.</p>
+
+<h2>5. Check yourself</h2>
+<section id="q9">
+<div class="quiz" data-explain="NX gives mutual exclusion and PX gives the auto-release, both in one atomic command, so no crash can land between them.">
+  <p class="q">Why <code>SET key token NX PX ttl</code> and not <code>SETNX</code> followed by <code>PEXPIRE</code>?</p>
+  <div class="opts"><button class="opt" data-correct>A crash between them leaves no TTL</button><button class="opt">SETNX is slower than SET NX PX</button><button class="opt">PEXPIRE does not work on string keys</button><button class="opt">SETNX cannot ever store a random token</button></div>
+</div>
+<div class="quiz" data-explain="The token is how release (and extend) prove ownership. Without it, an expired holder can delete someone else's lock.">
+  <p class="q">The random token's main job is…</p>
+  <div class="opts"><button class="opt" data-correct>Prove ownership on release</button><button class="opt">Make key name unique</button><button class="opt">Encrypt the stored value</button><button class="opt">Choose the storing node</button></div>
+</div>
+<div class="quiz" data-explain="GET and DEL as two calls leave a gap: the lock can expire and be re-acquired by B between them, and then you delete B's lock. The script closes that gap.">
+  <p class="q">Why must “check token, then delete” be a Lua script, not GET then DEL from Node?</p>
+  <div class="opts"><button class="opt" data-correct>Ownership can change between the calls</button><button class="opt">Node cannot compare two strings safely</button><button class="opt">DEL is not allowed after GET</button><button class="opt">Lua scripts run faster than commands</button></div>
+</div>
+<div class="quiz" data-explain="Deadlock-freedom: the TTL ensures a crashed holder can't block the resource forever.">
+  <p class="q">Which property does the TTL protect?</p>
+  <div class="opts"><button class="opt">Mutual exclusion</button><button class="opt" data-correct>Deadlock freedom</button><button class="opt">Fault tolerance</button><button class="opt">Fencing order</button></div>
+</div>
+<p class="score" data-for="q9"></p>
+</section>
+
+<details class="recall"><summary>From memory: write the acquire command and the release script.</summary>
+<code>SET lock:&lt;resource&gt; &lt;token&gt; NX PX &lt;ttl&gt;</code>, and <code>if get(KEYS[1]) == ARGV[1] then return del(KEYS[1]) else return 0 end</code>.</details>
+<details class="recall"><summary>From memory: name four flaws in the video's INCR lock.</summary>
+Losers bump the counter; INCR and TTL aren't atomic; plain DEL can delete someone else's lock; no owner identity.</details>
+
+<div class="assignment">
+<h3>Assignment 0009 = A1, parts 1, 2 and 5</h3>
+<p class="meta">≈30–45 min · <a href="../assignments/A1-seat-hold-lock/brief.html">open the A1 brief</a></p>
+<p>Implement <code>acquire</code> (for now, give it the fence too. The hint explains why it has to be in the same script), <code>release</code>, and <code>withLock</code>/<code>bookSeat</code>. Get the Part 1, 2 and 5 tests green. Leave fencing and extend for after Lesson 0010.</p>
+<pre>cd ~/learning-redis/assignments/A1-seat-hold-lock
+npm run race
+npm test</pre>
+</div>
+
+<div class="source"><h3>Primary source</h3><p><a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">Distributed Locks with Redis</a>. Read up to the end of “Correct Implementation with a Single Instance” (about 10 min). You'll read the rest in Lesson 0010.</p></div>
+<div class="ask"><h3>Stuck or curious?</h3><p>Paste a failing test, or ask “why not just use a Postgres advisory lock?”. That's a great question, and Lesson 0010 answers it.</p></div>
+
+<footer class="next">
+  <a href="0008-rate-limiting.html">← 0008</a>
+  <a href="0010-leases-fencing-and-redlock.html">0010 · Leases, fencing, Redlock →</a>
+</footer>
+</main>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>
